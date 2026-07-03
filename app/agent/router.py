@@ -743,7 +743,6 @@ def build_user_turn_content(
 def build_initial_messages(
     query_stripped: str,
     conversation_history: list[dict[str, str]] | None = None,
-    memory_context: str = "",
     attachment_bundle: UserAttachmentBundle | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -825,7 +824,6 @@ def build_initial_messages(
         "content": build_turn1_user_content(
             query_stripped,
             attachment_bundle,
-            memory_context=memory_context,
         ),
     })
 
@@ -1948,7 +1946,9 @@ async def execute_manage_room_schedule(
         if isinstance(extra_attendees, list):
             for item in extra_attendees:
                 if isinstance(item, dict):
-                    out.append({k: str(v) for k, v in item.items() if v})
+                    cleaned = {k: str(v) for k, v in item.items() if v}
+                    if cleaned:
+                        out.append(cleaned)
         return out
 
     logger.info(
@@ -2474,7 +2474,6 @@ async def async_agent_chat(
     messages = build_initial_messages(
         query_stripped,
         conversation_history=conversation_history,
-        memory_context=memory_context,
         attachment_bundle=attachment_bundle,
     )
 

@@ -38,6 +38,7 @@ def test_get_user_profile(user_id):
     try:
         # users.info API 호출
         response = client.users_info(user=user_id)
+        print(response)
         user_info = response["user"]
         profile = user_info["profile"]
         

@@ -2177,7 +2177,7 @@ def send_slack_briefing(
         return True
 
     token = os.getenv("SLACK_BOT_TOKEN", "")
-    channel = channel or os.getenv("GOV_PROJECT_SLACK_CHANNEL", "")
+    channel = channel or os.getenv("GOV_PROJECT_SLACK_CHANNEL", "") or os.getenv("GOV_BREIFING_CHANNEL_ID", "")
 
     if not token or not channel:
         print("[5·Serve] SLACK_BOT_TOKEN / GOV_PROJECT_SLACK_CHANNEL 미설정 — 브리핑 저장만 수행")

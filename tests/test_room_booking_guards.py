@@ -101,6 +101,84 @@ class TestOrganizerResolve(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(name, "User")
 
 
+class TestAttendeeNameVariants(unittest.TestCase):
+    def test_roster_expands_given_name(self):
+        from app.services.outlook_room.attendee_resolver import name_lookup_variants
+
+        with patch(
+            "app.services.outlook_room.attendee_resolver._match_employees_in_query",
+            return_value=["이소연"],
+        ):
+            self.assertEqual(name_lookup_variants("소연"), ["이소연", "소연"])
+
+    def test_full_name_includes_without_surname(self):
+        from app.services.outlook_room.attendee_resolver import name_lookup_variants
+
+        with patch(
+            "app.services.outlook_room.attendee_resolver._match_employees_in_query",
+            return_value=["이소연"],
+        ):
+            self.assertEqual(name_lookup_variants("이소연"), ["이소연", "소연"])
+
+    def test_unknown_name_keeps_original(self):
+        from app.services.outlook_room.attendee_resolver import name_lookup_variants
+
+        with patch(
+            "app.services.outlook_room.attendee_resolver._match_employees_in_query",
+            return_value=[],
+        ):
+            self.assertEqual(name_lookup_variants("금교현"), ["금교현"])
+
+
+class TestResolveAttendees(unittest.IsolatedAsyncioTestCase):
+    async def test_skips_empty_attendee_entry(self):
+        from app.services.outlook_room.attendee_resolver import resolve_attendees
+
+        with patch(
+            "app.services.outlook_room.attendee_resolver._resolve_attendee_hit",
+            new_callable=AsyncMock,
+            return_value={"email": "soyeon@connecteve.com", "name": "이소연"},
+        ) as mock_hit:
+            resolved, unresolved = await resolve_attendees(
+                [
+                    {"email": None, "name": None, "slack_user_id": None},
+                    {"name": "소연"},
+                ],
+                organizer_email="khkeum@connecteve.com",
+            )
+
+        self.assertEqual(resolved, [
+            {"email": "soyeon@connecteve.com", "name": "이소연"},
+        ])
+        self.assertEqual(unresolved, [])
+        mock_hit.assert_awaited_once()
+
+    async def test_tries_name_variants_for_db_lookup(self):
+        from app.services.outlook_room.attendee_resolver import (
+            _lookup_user_by_name_variants,
+        )
+
+        calls: list[str] = []
+
+        async def fake_lookup(*, name: str = "", **kwargs):
+            calls.append(name)
+            if name == "소연":
+                return {"email": "soyeon@connecteve.com", "name": "소연"}
+            return None
+
+        with patch(
+            "app.services.outlook_room.attendee_resolver._lookup_user_in_db",
+            side_effect=fake_lookup,
+        ), patch(
+            "app.services.outlook_room.attendee_resolver._match_employees_in_query",
+            return_value=["이소연"],
+        ):
+            hit = await _lookup_user_by_name_variants("소연")
+
+        self.assertEqual(hit, {"email": "soyeon@connecteve.com", "name": "소연"})
+        self.assertEqual(calls, ["이소연", "소연"])
+
+
 class TestDefaultEnd(unittest.TestCase):
     def test_one_hour(self):
         self.assertEqual(

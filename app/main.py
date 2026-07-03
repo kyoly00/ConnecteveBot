@@ -25,6 +25,9 @@ load_dotenv(_CONN_BOT_DIR / ".env")
 from app.core.config import (  # noqa: E402
     ATTACHMENTS_DIR,
     ATTACHMENTS_STATIC_MOUNT,
+    BOT_JOB_COMPLETED_RETENTION_DAYS,
+    BOT_JOB_FAILED_RETENTION_DAYS,
+    BOT_JOB_PURGE_BATCH_SIZE,
     BOT_JOB_WORKER_COUNT,
     GOV_FILES_MOUNT,
     GOV_PROJECTS_DAILY_DIR,
@@ -66,6 +69,7 @@ from app.services.bot_jobs.webhook_ingress import (
     enqueue_confluence_webhook,
     enqueue_graph_notification,
 )
+from app.services.bot_jobs.queue import purge_old_bot_jobs
 from app.services.bot_jobs.worker import start_bot_job_worker
 from app.services.chat import chat_service, memory_service, improvement_service
 from app.core.settings import get_settings
@@ -701,6 +705,21 @@ def run_data_cleanup() -> None:
 
 _data_cleanup_last_run_date = None
 
+
+async def run_bot_job_cleanup() -> None:
+    """bot_jobs completed/failed 오래된 행 정리."""
+    if os.getenv("BOT_JOB_PURGE_ENABLED", "true").lower() not in ("1", "true", "yes"):
+        return
+    try:
+        await purge_old_bot_jobs(
+            completed_retention_days=BOT_JOB_COMPLETED_RETENTION_DAYS,
+            failed_retention_days=BOT_JOB_FAILED_RETENTION_DAYS,
+            batch_size=BOT_JOB_PURGE_BATCH_SIZE,
+        )
+    except Exception as e:
+        logger.error("[BotJob] purge failed: %s", e)
+
+
 async def _data_cleanup_loop() -> None:
     """
     데이터 정리 백그라운드 태스크 루프.
@@ -712,6 +731,7 @@ async def _data_cleanup_loop() -> None:
     # 1. 서버 시작 시 즉시 1회 실행
     try:
         await loop.run_in_executor(None, run_data_cleanup)
+        await run_bot_job_cleanup()
         _data_cleanup_last_run_date = datetime.now().date()
     except Exception as e:
         logger.error(f"[DataCleanup] 시작 시 초기 데이터 정리 실패: {e}")
@@ -747,6 +767,7 @@ async def _data_cleanup_loop() -> None:
 
         try:
             await loop.run_in_executor(None, run_data_cleanup)
+            await run_bot_job_cleanup()
             _data_cleanup_last_run_date = today
         except Exception as e:
             logger.error(f"[DataCleanup] 정기 데이터 정리 실행 실패: {e}")

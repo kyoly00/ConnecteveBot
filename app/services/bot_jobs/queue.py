@@ -237,3 +237,63 @@ async def delete_jobs_by_source(source: str) -> int:
     if count:
         logger.info("[BotJob] deleted %d jobs source=%s", count, source)
     return count
+
+
+async def _purge_old_jobs_batch(
+    *,
+    status: str,
+    cutoff: datetime,
+    batch_size: int,
+) -> int:
+    ids_subq = (
+        select(BotJob.id)
+        .where(
+            BotJob.status == status,
+            BotJob.created_at < cutoff,
+        )
+        .limit(batch_size)
+    )
+    async with get_db_session() as session:
+        result = await session.execute(
+            delete(BotJob).where(BotJob.id.in_(ids_subq))
+        )
+        return result.rowcount or 0
+
+
+async def purge_old_bot_jobs(
+    *,
+    completed_retention_days: int = 3,
+    failed_retention_days: int = 7,
+    batch_size: int = 5000,
+) -> dict[str, int]:
+    """completed/failed 상태의 오래된 작업을 배치 삭제."""
+    now = _utcnow()
+    totals = {"completed": 0, "failed": 0}
+
+    for status, retention_days in (
+        (JobStatus.COMPLETED, completed_retention_days),
+        (JobStatus.FAILED, failed_retention_days),
+    ):
+        if retention_days < 0:
+            continue
+        cutoff = now - timedelta(days=retention_days)
+        while True:
+            count = await _purge_old_jobs_batch(
+                status=status,
+                cutoff=cutoff,
+                batch_size=batch_size,
+            )
+            totals[status] += count
+            if count < batch_size:
+                break
+
+    if totals["completed"] or totals["failed"]:
+        logger.info(
+            "[BotJob] purged completed=%d failed=%d "
+            "(retention %dd/%dd)",
+            totals["completed"],
+            totals["failed"],
+            completed_retention_days,
+            failed_retention_days,
+        )
+    return totals

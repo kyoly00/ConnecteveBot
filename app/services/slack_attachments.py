@@ -763,14 +763,9 @@ def _read_text(path: Path) -> str:
 def build_turn1_user_content(
     query_stripped: str,
     bundle: UserAttachmentBundle | None,
-    *,
-    memory_context: str = "",
 ) -> str:
     """Turn1 — 첨부 id·종류·파일명만 (메타 상세는 DB)."""
     parts: list[str] = []
-    mem = (memory_context or "").strip()
-    if mem:
-        parts.append(mem)
 
     if bundle and bundle.has_content:
         lines = ["<attachments>"]

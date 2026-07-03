@@ -185,6 +185,9 @@ DATABASE_URL_SYNC = os.getenv("DATABASE_URL_SYNC")
 BOT_JOB_WORKER_COUNT = int(os.getenv("BOT_JOB_WORKER_COUNT", "4"))
 BOT_JOB_POLL_INTERVAL_SEC = float(os.getenv("BOT_JOB_POLL_INTERVAL_SEC", "0.2"))
 BOT_JOB_LOCK_TIMEOUT_SEC = int(os.getenv("BOT_JOB_LOCK_TIMEOUT_SEC", "900"))
+BOT_JOB_COMPLETED_RETENTION_DAYS = int(os.getenv("BOT_JOB_COMPLETED_RETENTION_DAYS", "3"))
+BOT_JOB_FAILED_RETENTION_DAYS = int(os.getenv("BOT_JOB_FAILED_RETENTION_DAYS", "7"))
+BOT_JOB_PURGE_BATCH_SIZE = int(os.getenv("BOT_JOB_PURGE_BATCH_SIZE", "5000"))
 
 EXPENSE_ONEDRIVE_USER = os.getenv("EXPENSE_ONEDRIVE_USER", "").strip()
 EXPENSE_ONEDRIVE_BASE_FOLDER = os.getenv("EXPENSE_ONEDRIVE_BASE_FOLDER", "").strip().strip("/")
@@ -561,14 +564,17 @@ def get_routing_policy() -> str:
         "- [Flex 예외] 당일/월간 실시간 근태·출근·퇴근·재택·휴가 조회는 search_worker_schedule 우선\n"
         "- [회의실 예외] 회의실 예약·조회·변경·취소는 manage_room_schedule 우선\n"
         "- [외부 공고 예외] 외부 정부과제 공고 검색·브리핑은 query_gov_projects 우선\n"
+        
+        "[follow-up 처리]\n"
+        "새 질문에 다른 도메인 단서가 **명시**되어 있으면 현재 질문의 도메인을 우선한다.\n"
+        "새 질문이 생략형 follow-up이면 직전 턴의 **tool·domain·action**을 유지하고, 현재 질문에서 새로 언급된 슬롯만 갱신한다.\n"
+        "생략형 follow-up은 이름만 바뀐 질문, 기간만 바뀐 질문, 대상만 짧게 바뀐 질문을 포함한다.\n"
+        "사람 이름만 있는 질문은 도메인 전환 단서로 보지 않는다.\n\n"
 
-        "새 질문에 다른 도메인 단서가 **명시**돼있지 않다면, 직전 턴의 **주제·도메인·action**을 이어간다.\n\n"
-        "[생략형·기간·이름만 바뀐 follow-up]: tool·action과 확정된 식별자는 유지하고 **범위 인자만** 현재 질문에 맞게 갱신한다.\n"
-        "- [list] 회의 일정(person_name 생략=본인, 타인 지정 가능)·과거·참석자 → list\n"
-        "- [즉시 실행] book/room/시간 확정 → cancel/modify/replace(booking_id·맥락)\n\n"
         "[금지]\n"
-        "- 생략형 follow-up이 아닌데 직전 도메인을 억지로 유지하는 것. (현재 질문 우선)\n"
+        "- 생략형 follow-up이 아닌데 직전 도메인을 억지로 유지하는 것. 현재 질문 우선.\n"
         "- 맥락이 있는데 respond_general로 되묻는 것.\n"
+        "- 사람 이름만 보고 근태 조회로 전환하는 것.\n\n"
 
         "Turn1에서 바로 실행, 재확인 질문 금지\n"
         "- [조회 선행] 회의실 예약 없는 book·가용 질문만 check/check_all\n"
@@ -612,10 +618,8 @@ def format_session_summary_for_router(
     progress_line = (progress or "").strip() or "(없음)"
     return (
         "<conversation_summary>\n"
-        "다음은 이전 대화의 **압축 상태**이다. 과거 assistant 답변·참고 메모를 사실로 취급하지 않는다.\n"
-        "회사 규정·수치·절차가 필요하면 반드시 search_company_wiki로 새로 검색한다.\n"
-        "Turn1 라우팅 시 '진행 상태'·'다룬 주제'로 **직전 도메인**(회의실/근태/위키 등)을 파악하고 "
-        "생략형 follow-up의 tool·action 연속성에 활용한다.\n\n"
+        "conversation_summary는 장기 문맥 참고용이다.\n"
+        "직전 생략형 follow-up의 tool/action/slot 결정은 맥락 유지한다.\n"
         f"다룬 주제: {entities}\n"
         f"진행 상태: {progress_line}\n"
         f"요약: {summary_text}\n"

@@ -1023,9 +1023,8 @@ def send_slack_daily_news(text: str, channel: str | None = None) -> bool:
     token = os.getenv("SLACK_BOT_TOKEN", "")
     channel = (
         channel
-        or os.getenv("NEWS_DAILY_SLACK_CHANNEL", "")
         or os.getenv("GOV_PROJECT_SLACK_CHANNEL", "")
-        or os.getenv("FLEX_HR_SLACK_CHANNEL", "")
+        or os.getenv("NEWS_CHANNEL_ID", "")
     )
     if not token or not channel:
         logger.warning(

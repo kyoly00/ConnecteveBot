@@ -1311,7 +1311,7 @@ def send_slack_daily_roster(channel: str | None = None) -> bool:
         return True
 
     token = os.getenv("SLACK_BOT_TOKEN", "")
-    channel = channel or os.getenv("FLEX_HR_SLACK_CHANNEL", "") or os.getenv("GOV_PROJECT_SLACK_CHANNEL", "")
+    channel = channel or os.getenv("GOV_PROJECT_SLACK_CHANNEL", "") or os.getenv("HR_BRIEFING_CHANNEL_ID", "")
 
     if not token or not channel:
         print("[Flex HR] SLACK_BOT_TOKEN / FLEX_HR_SLACK_CHANNEL 미설정 — 슬랙 전송 스킵")
