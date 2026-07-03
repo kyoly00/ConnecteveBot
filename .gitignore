@@ -1,0 +1,30 @@
+# 데이터 및 데이터베이스 (대용량 및 로컬 데이터)
+Data/
+VectorDB/
+debug/
+
+# Python 자동 생성 파일 (캐시)
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# 환경 변수 및 설정 (보안 필수)
+.env
+
+# 토큰 캐시 (절대 커밋 금지)
+ms_app_token_cache.json
+ms_token_cache.json
+*token_cache*.json
+
+# 기타 로그 및 임시 파일
+*.log
+.DS_Store
+
+# (주의) .md 파일 제외 설정
+# 모든 .md 파일을 제외하고 싶다면 아래 주석을 해제하세요.
+*.md
+**/*.md
+*.txt
+tests/.deepeval/
+tests/eval_runs/
+tests/qa_results/

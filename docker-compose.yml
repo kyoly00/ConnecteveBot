@@ -1,0 +1,56 @@
+services:
+  es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: es
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms2g -Xmx2g"
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - type: bind
+        source: C:\es_data
+        target: /usr/share/elasticsearch/data
+    networks:
+      - elastic-net
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://es:9200
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      - es
+    networks:
+      - elastic-net
+
+  postgres:
+    image: postgres:16
+    container_name: connbot-postgres
+    environment:
+      POSTGRES_DB: connbot
+      POSTGRES_USER: connbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: Asia/Seoul
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - connbot_postgres_data:/var/lib/postgresql/data
+    networks:
+      - elastic-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connbot -d connbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  connbot_postgres_data:
+
+networks:
+  elastic-net:
+    driver: bridge
