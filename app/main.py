@@ -104,20 +104,18 @@ GOV_PIPELINE_HOUR = int(os.getenv("GOV_PIPELINE_HOUR", "11"))
 GOV_PIPELINE_MINUTE = int(os.getenv("GOV_PIPELINE_MINUTE", "00"))
 
 FLEX_HR_DAILY_POLL_INTERVAL_SEC = int(os.getenv("FLEX_HR_POLL_INTERVAL_SEC", "300"))
+FLEX_HR_MONTHLY_POLL_INTERVAL_SEC = int(os.getenv("FLEX_HR_MONTHLY_POLL_INTERVAL_SEC", os.getenv("FLEX_HR_POLL_INTERVAL_SEC", "300")))
 
 FLEX_HR_DAILY_SLACK_HOUR = int(os.getenv("FLEX_HR_DAILY_HOUR", "11"))
 FLEX_HR_DAILY_SLACK_MINUTE = int(os.getenv("FLEX_HR_DAILY_MINUTE", "00"))
-
-FLEX_HR_MONTHLY_UPDATE_HOUR = int(os.getenv("FLEX_HR_MONTHLY_NOON_HOUR", "11"))
-FLEX_HR_MONTHLY_UPDATE_MINUTE = int(os.getenv("FLEX_HR_MONTHLY_NOON_MINUTE", "00"))
 
 # Flex Playwright 세션 주간 갱신 (월=0 … 일=6)
 FLEX_SESSION_REFRESH_WEEKDAY = int(os.getenv("FLEX_SESSION_REFRESH_WEEKDAY", "0"))
 FLEX_SESSION_REFRESH_HOUR = int(os.getenv("FLEX_SESSION_REFRESH_HOUR", "10"))
 FLEX_SESSION_REFRESH_MINUTE = int(os.getenv("FLEX_SESSION_REFRESH_MINUTE", "0"))
 
-NEWS_DAILY_SLACK_HOUR = int(os.getenv("NEWS_DAILY_SLACK_HOUR", "11"))
-NEWS_DAILY_SLACK_MINUTE = int(os.getenv("NEWS_DAILY_SLACK_MINUTE", "00"))
+NEWS_DAILY_SLACK_HOUR = int(os.getenv("NEWS_DAILY_SLACK_HOUR", "13"))
+NEWS_DAILY_SLACK_MINUTE = int(os.getenv("NEWS_DAILY_SLACK_MINUTE", "30"))
 
 ROOM_REMINDER_POLL_INTERVAL_SEC = int(os.getenv("ROOM_REMINDER_POLL_INTERVAL_SEC", "60"))
 
@@ -175,21 +173,6 @@ def _next_weekly_scheduled_time(
     if days_ahead == 0 and target <= now:
         days_ahead = 7
     return target + timedelta(days=days_ahead)
-
-
-def _next_flex_hr_monthly_scheduled_run(
-    now: datetime | None = None,
-    *,
-    earliest_date=None,
-) -> datetime:
-    now = now or _now_kst()
-    return _next_scheduled_time(
-        now,
-        hour=FLEX_HR_MONTHLY_UPDATE_HOUR,
-        minute=FLEX_HR_MONTHLY_UPDATE_MINUTE,
-        earliest_date=earliest_date,
-    )
-
 
 # 2. 비동기 슬랙 앱 (API client) 및 서명 검증
 def _create_slack_app() -> AsyncApp:
@@ -266,11 +249,10 @@ async def startup_event():
         logger.info("Flex HR 일간 폴링 시작 (interval=%ds)", FLEX_HR_DAILY_POLL_INTERVAL_SEC)
 
     if os.getenv("FLEX_HR_MONTHLY_SCHEDULE_ENABLED", "true").lower() in ("1", "true", "yes"):
-        asyncio.create_task(_flex_hr_monthly_noon_loop())
+        asyncio.create_task(_flex_hr_monthly_poll_loop(FLEX_HR_MONTHLY_POLL_INTERVAL_SEC))
         logger.info(
-            "Flex HR 월간 정기 갱신 시작 (매일 %02d:%02d KST, 이번달+다음달)",
-            FLEX_HR_MONTHLY_UPDATE_HOUR,
-            FLEX_HR_MONTHLY_UPDATE_MINUTE,
+            "Flex HR 월간 폴링 시작 (interval=%ds, 이번달+다음달)",
+            FLEX_HR_MONTHLY_POLL_INTERVAL_SEC,
         )
 
     if os.getenv("FLEX_HR_MONTHLY_BOOTSTRAP_ON_STARTUP", "true").lower() in ("1", "true", "yes"):
@@ -403,8 +385,6 @@ async def _flex_hr_poll_loop(interval_sec: int) -> None:
 
 
 
-_flex_hr_monthly_last_run_date = None
-
 async def _flex_hr_monthly_bootstrap_once() -> None:
     """기동 시 월간 부트스트랩 — 전월·당월·익월 중 누락분 수집."""
     from app.services.flex_hr.flex_hr import run_flex_hr_monthly_bootstrap
@@ -416,51 +396,24 @@ async def _flex_hr_monthly_bootstrap_once() -> None:
     except Exception as e:
         logger.error("Flex HR 월간 부트스트랩(기동) 실패: %s", e)
 
-
-async def _flex_hr_monthly_noon_loop() -> None:
-    """Flex HR — 매일 정오 이번 달·다음 달 월간 근태 갱신."""
-    global _flex_hr_monthly_last_run_date
-    from datetime import datetime, timedelta
+async def _flex_hr_monthly_poll_loop(interval_sec: int) -> None:
+    """Flex HR — 월간(이번달+다음달) HTML 수집·JSON 갱신. 일간과 동일 주기."""
     from app.services.flex_hr.flex_hr import run_flex_hr_monthly_scheduled_update
 
     loop = asyncio.get_event_loop()
-    logger.info(
-        "Flex HR 월간 정기 갱신 시각: %02d:%02d KST",
-        FLEX_HR_MONTHLY_UPDATE_HOUR,
-        FLEX_HR_MONTHLY_UPDATE_MINUTE,
-    )
+    try:
+        report = await loop.run_in_executor(None, run_flex_hr_monthly_scheduled_update)
+        logger.info("Flex HR 월간 폴링(기동): %s", report)
+    except Exception as e:
+        logger.error("Flex HR 월간 폴링(기동) 실패: %s", e)
 
     while True:
-        now = _now_kst()
-        today = now.date()
-
-        if _flex_hr_monthly_last_run_date == today:
-            next_run = _next_flex_hr_monthly_scheduled_run(
-                now,
-                earliest_date=today + timedelta(days=1),
-            )
-        else:
-            next_run = _next_flex_hr_monthly_scheduled_run(now)
-
-        wait_sec = max(1.0, (next_run - now).total_seconds())
-        logger.info(
-            "Flex HR 월간 정기 갱신 다음 실행: %s (%.0fs 후)",
-            next_run.isoformat(),
-            wait_sec,
-        )
-        await asyncio.sleep(wait_sec)
-
-        today = _now_kst().date()
-        if _flex_hr_monthly_last_run_date == today:
-            continue
-
+        await asyncio.sleep(interval_sec)
         try:
             report = await loop.run_in_executor(None, run_flex_hr_monthly_scheduled_update)
-            logger.info("Flex HR 월간 정기 갱신 완료: %s", report)
-            _flex_hr_monthly_last_run_date = today
+            logger.info("Flex HR 월간 폴링: %s", report)
         except Exception as e:
-            logger.error("Flex HR 월간 정기 갱신 실패: %s", e)
-
+            logger.error("Flex HR 월간 폴링 실패: %s", e)
 
 _flex_session_refresh_last_run_date = None
 

@@ -165,6 +165,41 @@ async def should_skip_app_welcome(
         return msg_count > 0
 
 
+async def get_session_agent_slots(session_id: uuid.UUID) -> dict[str, Any]:
+    """chat_sessions.metadata.agent_slots 로드."""
+    from app.services.session_slots import empty_agent_slots, load_agent_slots
+
+    async with get_db_session() as session:
+        stmt = select(ChatSession).where(ChatSession.id == session_id)
+        result = await session.execute(stmt)
+        chat_session = result.scalar_one_or_none()
+        if not chat_session:
+            return empty_agent_slots()
+        meta = chat_session.metadata_ if isinstance(chat_session.metadata_, dict) else {}
+        return load_agent_slots(meta)
+
+
+async def save_session_agent_slots(
+    session_id: uuid.UUID,
+    slots: dict[str, Any],
+) -> None:
+    """chat_sessions.metadata.agent_slots 저장."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.services.session_slots import dump_agent_slots_into_metadata
+
+    async with get_db_session() as session:
+        stmt = select(ChatSession).where(ChatSession.id == session_id)
+        result = await session.execute(stmt)
+        chat_session = result.scalar_one_or_none()
+        if not chat_session:
+            return
+        meta = dict(chat_session.metadata_ or {}) if isinstance(chat_session.metadata_, dict) else {}
+        chat_session.metadata_ = dump_agent_slots_into_metadata(meta, slots)
+        flag_modified(chat_session, "metadata_")
+        await session.flush()
+
+
 async def mark_app_welcome_sent(
     *,
     user_id: uuid.UUID,

@@ -315,7 +315,7 @@ def previous_year_month(year_month: str | None = None) -> str:
 
 
 def scheduled_monthly_year_months() -> list[str]:
-    """매일 정오 갱신 대상 — 이번 달 + 다음 달."""
+    """정기 폴링 갱신 대상 — 이번 달 + 다음 달."""
     current = current_year_month()
     return list(dict.fromkeys([current, next_year_month(current)]))
 
@@ -1692,7 +1692,7 @@ def run_flex_hr_monthly_updates_for_months(
 
 
 def run_flex_hr_monthly_scheduled_update(url: str | None = None) -> dict[str, Any]:
-    """정오 스케줄 — 이번 달·다음 달 월간 데이터 갱신."""
+    """정기 폴링 — 이번 달·다음 달 월간 데이터 갱신."""
     months = scheduled_monthly_year_months()
     print(f"[Flex HR] 월간 정기 갱신 시작 — {', '.join(months)}")
     reports = run_flex_hr_monthly_updates_for_months(months, url=url, skip_existing=False)
@@ -1707,7 +1707,7 @@ def run_flex_hr_monthly_bootstrap(url: str | None = None) -> dict[str, Any]:
 
 
 def run_flex_hr_updates(url: str | None = None, date: str | None = None) -> dict[str, Any]:
-    """일간 Flex HR 데이터만 갱신한다 (월간은 정오 스케줄)."""
+    """일간 Flex HR 데이터만 갱신한다 (월간은 별도 폴링)."""
     daily = run_flex_hr_update(url=url, date=date)
     return {"daily": daily}
 

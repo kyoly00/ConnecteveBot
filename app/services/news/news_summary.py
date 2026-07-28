@@ -438,18 +438,99 @@ def format_previous_top10_for_prompt(articles: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def load_previous_top10_for_prompt(run_date: str | date) -> str:
-    """전날 top10.json을 LLM 중복 제외용 프롬프트 텍스트로 변환."""
+def load_previous_top10_articles(run_date: str | date) -> List[dict]:
+    """전날 top10.json articles 로드. 없거나 실패 시 []."""
     day = _parse_run_date(run_date)
     prev_day = (day - timedelta(days=1)).isoformat()
     path = DAILY_NEWS_CRAWLING_DIR / prev_day / "top10.json"
-    if not path.exists():
-        logger.info("[news] previous top10 not found: %s", path)
-        return "(없음)"
-    with path.open(encoding="utf-8") as f:
-        data = json.load(f)
-    articles = [dict(title=article.get("title")) or []]
-    return format_previous_top10_for_prompt(articles)
+    try:
+        if not path.exists():
+            logger.info("[news] previous top10 not found: %s", path)
+            return []
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+        articles = data.get("articles") if isinstance(data, dict) else data
+        return articles if isinstance(articles, list) else []
+    except Exception as e:
+        logger.warning("[news] previous top10 load failed (%s): %s", path, e)
+        return []
+
+
+def load_previous_top10_for_prompt(run_date: str | date) -> str:
+    """전날 top10.json을 LLM 중복 제외용 프롬프트 텍스트로 변환."""
+    return format_previous_top10_for_prompt(load_previous_top10_articles(run_date))
+
+
+def previous_top10_exclusion_keys(articles: List[dict] | None) -> tuple[set[str], set[str]]:
+    """전날 top10 URL/제목 키 (하드 제외용)."""
+    urls: set[str] = set()
+    titles: set[str] = set()
+    for article in articles or []:
+        if not isinstance(article, dict):
+            continue
+        url = normalize_url(str(article.get("url") or ""))
+        title = text_key(str(article.get("title") or ""))
+        if url:
+            urls.add(url)
+        if title:
+            titles.add(title)
+    return urls, titles
+
+
+def matched_company_keywords(text: str) -> list[str]:
+    """제목/본문에 걸린 company_keywords (긴 키워드 우선, 부분 중복 키는 그대로 모두)."""
+    t = text_key(text)
+    hits = [k for k in KEYWORD_SETS["company_keywords"] if k and text_key(k) in t]
+    hits.sort(key=lambda k: len(text_key(k)), reverse=True)
+    return hits
+
+
+def dedupe_final_articles(
+    articles: List[ArticleCandidate],
+    *,
+    top_n: int,
+    previous_urls: set[str] | None = None,
+    previous_titles: set[str] | None = None,
+) -> List[ArticleCandidate]:
+    """
+    TopN 하드 중복 제거:
+    - 동일 URL / 동일 제목
+    - 전날 top10 URL·제목
+    - company_keywords에 걸린 동일 상호명(제목 기준) 1개만
+    """
+    prev_urls = previous_urls or set()
+    prev_titles = previous_titles or set()
+    seen_urls: set[str] = set()
+    seen_titles: set[str] = set()
+    seen_companies: set[str] = set()
+    out: List[ArticleCandidate] = []
+
+    for article in articles:
+        url = normalize_url(article.url or "")
+        title = text_key(article.title or "")
+        if url and (url in seen_urls or url in prev_urls):
+            logger.info("[news] drop dup/prev url: %s", url)
+            continue
+        if title and (title in seen_titles or title in prev_titles):
+            logger.info("[news] drop dup/prev title: %s", (article.title or "")[:80])
+            continue
+        companies = [text_key(k) for k in matched_company_keywords(article.title or "")]
+        if companies and any(c in seen_companies for c in companies):
+            logger.info(
+                "[news] drop company overlap (%s): %s",
+                ",".join(companies),
+                (article.title or "")[:80],
+            )
+            continue
+        if url:
+            seen_urls.add(url)
+        if title:
+            seen_titles.add(title)
+        seen_companies.update(companies)
+        out.append(article)
+        if len(out) >= top_n:
+            break
+    return out
 
 
 def articles_to_candidates(articles: List[dict]) -> List[ArticleCandidate]:
@@ -712,10 +793,13 @@ def llm_final_summarize(
     top_n: int = 10,
     *,
     previous_top10_text: str = "(없음)",
+    previous_urls: set[str] | None = None,
+    previous_titles: set[str] | None = None,
 ) -> List[ArticleCandidate]:
     """
     제목+링크+본문100자 기반 최종 랭킹 및 한줄 요약.
     API Key가 없으면 fallback 요약 생성.
+    LLM 결과 이후 URL/제목/전날/회사명 하드 중복 제거.
     """
     candidates = candidates[:80]  # 비용 관리
     prompt = f"""
@@ -730,6 +814,7 @@ def llm_final_summarize(
 출력 조건:
 - 최대 {top_n}개
 - title, url은 원문 그대로 유지
+- 같은 url 또는 같은 제목을 items에 두 번 넣지 말 것
 - summary는 한국어 한줄 요약. 80자 이내.
 - category는 다음 중 하나:
   ["인허가/규제", "수가/보험", "병원도입/사업화", "정부사업/R&D", "정형외과/근골격계", "수술로봇/인공관절", "의료AI/영상분석", "경쟁사/투자"]
@@ -773,27 +858,33 @@ def llm_final_summarize(
     result = llm_json(prompt, payload)
     if not result or "items" not in result:
         # fallback
-        fallback = sorted(candidates, key=lambda x: (x.llm_title_score, x.primary_score), reverse=True)[:top_n]
+        fallback = sorted(candidates, key=lambda x: (x.llm_title_score, x.primary_score), reverse=True)
         for a in fallback:
             a.final_score = a.llm_title_score or a.primary_score
             a.category = infer_category(a.title)
             a.summary = fallback_summary(a)
-        return fallback
+        return dedupe_final_articles(
+            fallback,
+            top_n=top_n,
+            previous_urls=previous_urls,
+            previous_titles=previous_titles,
+        )
 
-    by_url = {a.url: a for a in candidates}
-    final: List[ArticleCandidate] = []
+    by_url = {normalize_url(a.url): a for a in candidates}
+    picked: List[ArticleCandidate] = []
 
-    for item in result["items"][:top_n]:
-        url = item.get("url")
-        if url not in by_url:
+    for item in result["items"]:
+        raw_url = str(item.get("url") or "")
+        url = normalize_url(raw_url)
+        if url in by_url:
+            article = by_url[url]
+        else:
             # URL이 조금 바뀌었을 경우 title로 보정
             title = text_key(item.get("title", ""))
             match = next((a for a in candidates if text_key(a.title) == title), None)
             if not match:
                 continue
             article = match
-        else:
-            article = by_url[url]
 
         article.summary = normalize_space(str(item.get("summary", "")))[:120]
         article.category = normalize_space(str(item.get("category", "")))[:40]
@@ -801,10 +892,39 @@ def llm_final_summarize(
             article.final_score = int(item.get("fit_score", 0))
         except Exception:
             article.final_score = article.llm_title_score
-        final.append(article)
+        picked.append(article)
 
-    final.sort(key=lambda x: x.final_score, reverse=True)
-    return final[:top_n]
+    picked.sort(key=lambda x: x.final_score, reverse=True)
+    final = dedupe_final_articles(
+        picked,
+        top_n=top_n,
+        previous_urls=previous_urls,
+        previous_titles=previous_titles,
+    )
+
+    # LLM이 중복만 많이 내거나 전날 제외로 부족하면 후보에서 보충
+    if len(final) < top_n:
+        used = {normalize_url(a.url) for a in final if a.url}
+        fillers = sorted(
+            [a for a in candidates if normalize_url(a.url) not in used],
+            key=lambda x: (x.llm_title_score or 0, x.primary_score or 0),
+            reverse=True,
+        )
+        for a in fillers:
+            if not a.summary:
+                a.summary = fallback_summary(a)
+            if not a.category:
+                a.category = infer_category(a.title)
+            if not a.final_score:
+                a.final_score = a.llm_title_score or a.primary_score
+        final = dedupe_final_articles(
+            final + fillers,
+            top_n=top_n,
+            previous_urls=previous_urls,
+            previous_titles=previous_titles,
+        )
+
+    return final
 
 
 def infer_category(title: str) -> str:
@@ -948,8 +1068,16 @@ def run_from_deduped(
     print(f"        passed: {len(second)}")
 
     print(f"[step 5] LLM final top {top_n}")
-    previous_top10_text = load_previous_top10_for_prompt(day)
-    final = llm_final_summarize(second, top_n=top_n, previous_top10_text=previous_top10_text)
+    previous_articles = load_previous_top10_articles(day)
+    previous_top10_text = format_previous_top10_for_prompt(previous_articles)
+    prev_urls, prev_titles = previous_top10_exclusion_keys(previous_articles)
+    final = llm_final_summarize(
+        second,
+        top_n=top_n,
+        previous_top10_text=previous_top10_text,
+        previous_urls=prev_urls,
+        previous_titles=prev_titles,
+    )
     print(f"        final: {len(final)}")
 
     daily_paths = save_daily_top_outputs(final, day)
@@ -980,8 +1108,16 @@ def run_once(max_per_source: int, enrich_body_limit: int, top_n: int) -> List[Ar
 
     print("[step 5] LLM final summarize")
     day = dt.datetime.now(KST).strftime("%Y-%m-%d")
-    previous_top10_text = load_previous_top10_for_prompt(day)
-    final = llm_final_summarize(second, top_n=top_n, previous_top10_text=previous_top10_text)
+    previous_articles = load_previous_top10_articles(day)
+    previous_top10_text = format_previous_top10_for_prompt(previous_articles)
+    prev_urls, prev_titles = previous_top10_exclusion_keys(previous_articles)
+    final = llm_final_summarize(
+        second,
+        top_n=top_n,
+        previous_top10_text=previous_top10_text,
+        previous_urls=prev_urls,
+        previous_titles=prev_titles,
+    )
     print(f"[step 5] final: {len(final)}")
 
     paths = save_outputs(final)

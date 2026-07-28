@@ -116,6 +116,15 @@ from app.services.outlook_room.schedule_reserve import (
     set_room_reminder,
     room_name_maps_to_managed,
 )
+from app.services.session_slots import (
+    apply_slots_to_tool_args,
+    build_session_slots_block,
+    empty_agent_slots,
+    extract_event_id_from_text,
+    merge_slots_from_tool_result,
+    should_override_with_slot_followup,
+    suggest_slot_followup_call,
+)
 from app.services.outlook_room.schedule_reserve import (
     default_end_time_one_hour as room_default_end_time,
 )
@@ -673,6 +682,43 @@ def _make_recovered_tool_call(tool_name: str, args: dict[str, Any]) -> _Recovere
     )
 
 
+def _tool_call_name(tool_call: Any) -> str:
+    return str(getattr(getattr(tool_call, "function", None), "name", "") or "")
+
+
+def apply_session_slots_to_tool_calls(
+    tool_calls: list[Any],
+    *,
+    slots: dict[str, Any] | None,
+    query: str,
+) -> list[Any]:
+    """슬롯 follow-up 강제 + args 보강."""
+    slots = slots or empty_agent_slots()
+    names = [_tool_call_name(tc) for tc in tool_calls]
+    out: list[Any] = list(tool_calls or [])
+
+    if should_override_with_slot_followup(names, query, slots):
+        forced = suggest_slot_followup_call(query, slots)
+        if forced:
+            logger.info(
+                "[Agent] session slot follow-up override → %s %s",
+                forced["tool"],
+                forced.get("args", {}).get("action"),
+            )
+            out = [_make_recovered_tool_call(forced["tool"], dict(forced["args"]))]
+
+    injected: list[Any] = []
+    for tc in out:
+        name = _tool_call_name(tc)
+        raw_args = parse_tool_arguments(getattr(getattr(tc, "function", None), "arguments", None))
+        new_args = apply_slots_to_tool_args(name, raw_args, slots, query)
+        if new_args != raw_args:
+            injected.append(_make_recovered_tool_call(name, new_args))
+        else:
+            injected.append(tc)
+    return injected
+
+
 def sanitize_turn1_assistant_content(
     content: str | None,
     *,
@@ -864,6 +910,7 @@ def build_initial_messages(
     query_stripped: str,
     conversation_history: list[dict[str, str]] | None = None,
     attachment_bundle: UserAttachmentBundle | None = None,
+    agent_slots: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     1차 OpenAI 호출용 messages.
@@ -898,6 +945,10 @@ def build_initial_messages(
 
     for block in compact_blocks:
         messages.append({"role": "system", "content": block})
+
+    slots_block = build_session_slots_block(agent_slots)
+    if slots_block:
+        messages.append({"role": "system", "content": slots_block})
 
     room_ctx = build_active_room_context_block(turn_messages or history)
     if room_ctx:
@@ -2214,7 +2265,7 @@ async def execute_manage_room_schedule(
             )
         else:
             book_end = end_time or room_default_end_time(start_time)
-            content, _booking = await book_room(
+            content, booking_meta = await book_room(
                 resolved_room,
                 book_subject,
                 start_time,
@@ -2226,6 +2277,11 @@ async def execute_manage_room_schedule(
                 slack_user_id=requester_slack_user_id,
                 slack_channel_id=requester_slack_channel_id,
             )
+            if isinstance(booking_meta, dict) and booking_meta.get("booking_id"):
+                resolved_booking_id = str(booking_meta["booking_id"])
+            room_name = resolved_room
+            if start_time and not date_str:
+                date_str = start_time[:10] if len(start_time) >= 10 else date_str
 
     elif action == "set_reminder":
         if reminder_minutes <= 0:
@@ -2355,6 +2411,10 @@ async def execute_manage_room_schedule(
         "tool_call_id": tool_call.id,
         "action": action,
         "room_name": room_name,
+        "subject": subject or None,
+        "date": date_str or (start_time[:10] if start_time and len(start_time) >= 10 else None),
+        "start_time": start_time or None,
+        "end_time": end_time or None,
     }
     if resolved_booking_id:
         tool_result["booking_id"] = resolved_booking_id
@@ -2460,10 +2520,17 @@ async def execute_manage_personal_schedule(
     else:
         content = "지원하지 않는 작업입니다. list·create·modify·cancel 중 하나를 사용하세요."
 
+    event_id_out = event_id or extract_event_id_from_text(content)
     tool_result = {
         "tool_name": "manage_personal_schedule",
         "tool_call_id": tool_call.id,
         "action": action,
+        "event_id": event_id_out,
+        "subject": new_subject or subject,
+        "date": date_str,
+        "start_time": new_start_time or start_time,
+        "end_time": new_end_time or end_time,
+        "attendees": attendees if isinstance(attendees, list) else None,
     }
     return sanitize_user_facing_tool_message(content), tool_result
 
@@ -2513,14 +2580,15 @@ async def execute_tool_calls(
     requester_slack_user_id: str | None = None,
     requester_slack_channel_id: str | None = None,
     attachment_bundle: UserAttachmentBundle | None = None,
-) -> tuple[list, list[dict[str, Any]], list[dict[str, Any]], str, str, str, str, str]:
+    agent_slots: dict[str, Any] | None = None,
+) -> tuple[list, list[dict[str, Any]], list[dict[str, Any]], str, str, str, str, str, dict[str, Any]]:
     """
     assistant가 요청한 tool_calls 실행.
 
     Returns:
         unique_docs, tool_results, gov_attachments, gov_context_text,
         flex_context_text, room_context_text, expense_context_text,
-        personal_context_text
+        personal_context_text, updated_agent_slots
     """
 
     all_docs = []
@@ -2532,9 +2600,10 @@ async def execute_tool_calls(
     expense_context_parts: list[str] = []
     personal_context_parts: list[str] = []
     personal_write_executed = False
+    slots = dict(agent_slots or empty_agent_slots())
 
     if not tool_calls:
-        return all_docs, tool_results, gov_attachments, "", "", "", "", ""
+        return all_docs, tool_results, gov_attachments, "", "", "", "", "", slots
 
     messages.append(
         {
@@ -2708,6 +2777,20 @@ async def execute_tool_calls(
             }
         )
 
+        try:
+            call_args = parse_tool_arguments(
+                getattr(getattr(tool_call, "function", None), "arguments", None)
+            )
+            slots = merge_slots_from_tool_result(
+                slots,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                tool_args=call_args,
+                tool_content=tool_content,
+            )
+        except Exception:
+            logger.debug("[Agent] session slot merge skipped", exc_info=True)
+
     # hybrid_search가 이미 parent_section 단위로 collapse한 경우 재병합하지 않음
     if all_docs and all((getattr(d, "payload") or {}).get("merged_chunks") for d in all_docs):
         unique_docs = sorted(
@@ -2732,6 +2815,7 @@ async def execute_tool_calls(
         room_context_text,
         expense_context_text,
         personal_context_text,
+        slots,
     )
 
 
@@ -2772,10 +2856,20 @@ async def async_agent_chat(
         query_stripped = "첨부 파일 내용을 참고해 주세요."
 
     tools = get_agent_tools()
+    agent_slots = empty_agent_slots()
+    if db_session_id is not None:
+        try:
+            from app.services.chat import chat_service as _chat_svc
+
+            agent_slots = await _chat_svc.get_session_agent_slots(db_session_id)
+        except Exception:
+            logger.debug("[Agent] load agent_slots failed", exc_info=True)
+
     messages = build_initial_messages(
         query_stripped,
         conversation_history=conversation_history,
         attachment_bundle=attachment_bundle,
+        agent_slots=agent_slots,
     )
 
     client = _get_async_openai()
@@ -2898,6 +2992,12 @@ async def async_agent_chat(
                     session_id,
                 )
 
+        effective_tool_calls = apply_session_slots_to_tool_calls(
+            effective_tool_calls,
+            slots=agent_slots,
+            query=query_stripped,
+        )
+
         sanitized_content = sanitize_turn1_assistant_content(
             message.content,
             has_attachments=has_attachments,
@@ -2994,6 +3094,7 @@ async def async_agent_chat(
             room_context_text,
             expense_context_text,
             personal_context_text,
+            agent_slots,
         ) = await execute_tool_calls(
             messages=messages,
             tool_calls=business_tool_calls,
@@ -3007,7 +3108,15 @@ async def async_agent_chat(
             requester_slack_user_id=requester_slack_user_id,
             requester_slack_channel_id=requester_slack_channel_id,
             attachment_bundle=attachment_bundle if has_attachments else None,
+            agent_slots=agent_slots,
         )
+        if db_session_id is not None:
+            try:
+                from app.services.chat import chat_service as _chat_svc
+
+                await _chat_svc.save_session_agent_slots(db_session_id, agent_slots)
+            except Exception:
+                logger.debug("[Agent] save agent_slots failed", exc_info=True)
         search_duration_sec = _duration_sec(time.perf_counter() - search_t0)
         search_finished_at = _ts_sec()
         has_docs = bool(all_docs)
