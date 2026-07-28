@@ -30,14 +30,16 @@ async def main():
         await close_db()
 
     ddl_dir = Path(__file__).resolve().parent.parent.parent / "ddl"
-    print(f"\n테이블 생성 명령:")
-    for name in (
+    ddl_files = (
         "001_initial_schema.sql",
         "002_room_bookings.sql",
+        "003_room_booking_reminders.sql",
         "003_chat_attachments.sql",
         "004_managed_room_events.sql",
         "005_bot_jobs.sql",
-    ):
+    )
+    print(f"\n테이블 생성 명령 (또는 python scripts/reset_db.py --no-docker):")
+    for name in ddl_files:
         path = ddl_dir / name
         if path.exists():
             print(f'  docker exec -i connbot-postgres psql -U connbot -d connbot < "{path}"')

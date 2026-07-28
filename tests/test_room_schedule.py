@@ -14,6 +14,7 @@ from app.services.outlook_room.schedule_reserve import (
     is_room_status_query,
     normalize_room_tool_args,
     parse_time_range_from_query,
+    should_reroute_list_to_room_check,
     _normalize_check_slot,
 )
 
@@ -104,6 +105,33 @@ class TestNormalizeRoomArgs(unittest.TestCase):
     def test_operational_context_not_wiki_only(self):
         wiki_hist = [{"role": "user", "content": "회의실 관련해서도 있나?"}]
         self.assertFalse(has_recent_operational_room_context(wiki_hist))
+
+    def test_list_with_room_name_reroutes_to_check(self):
+        q = "내일 spine 회의실 일정 알려줘"
+        self.assertTrue(should_reroute_list_to_room_check(q, {
+            "action": "list",
+            "room_name": "Spine 회의실",
+        }))
+        args = normalize_room_tool_args({
+            "action": "list",
+            "room_name": "Spine 회의실",
+            "date": "2026-07-28",
+            "end_date": "2026-07-28",
+        }, q)
+        self.assertEqual(args["action"], "check")
+        self.assertEqual(args["room_name"], "Spine 회의실")
+        self.assertNotIn("end_date", args)
+
+    def test_list_with_person_name_stays_list(self):
+        q = "이번 주 소연님 회의 일정"
+        args = normalize_room_tool_args({
+            "action": "list",
+            "room_name": "Spine 회의실",
+            "date": "2026-07-28",
+            "person_name": "소연",
+        }, q)
+        self.assertEqual(args["action"], "list")
+        self.assertEqual(args["person_name"], "소연")
 
 
 if __name__ == "__main__":

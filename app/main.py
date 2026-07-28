@@ -69,7 +69,7 @@ from app.services.bot_jobs.webhook_ingress import (
     enqueue_confluence_webhook,
     enqueue_graph_notification,
 )
-from app.services.bot_jobs.queue import purge_old_bot_jobs
+from app.services.bot_jobs.queue import purge_old_bot_jobs, fail_queued_slack_jobs_wrong_team
 from app.services.bot_jobs.worker import start_bot_job_worker
 from app.services.chat import chat_service, memory_service, improvement_service
 from app.core.settings import get_settings
@@ -100,28 +100,45 @@ KST = ZoneInfo("Asia/Seoul")
 # =============================================================================
 CONFLUENCE_TRASH_POLL_INTERVAL_SEC = int(os.getenv("CONFLUENCE_TRASH_POLL_INTERVAL_SEC", "3600"))
 
-GOV_PIPELINE_HOUR = int(os.getenv("GOV_PIPELINE_HOUR", "10"))
-GOV_PIPELINE_MINUTE = int(os.getenv("GOV_PIPELINE_MINUTE", "32"))
+GOV_PIPELINE_HOUR = int(os.getenv("GOV_PIPELINE_HOUR", "11"))
+GOV_PIPELINE_MINUTE = int(os.getenv("GOV_PIPELINE_MINUTE", "00"))
 
-FLEX_HR_DAILY_POLL_INTERVAL_SEC = int(os.getenv("FLEX_HR_POLL_INTERVAL_SEC", "3600"))
+FLEX_HR_DAILY_POLL_INTERVAL_SEC = int(os.getenv("FLEX_HR_POLL_INTERVAL_SEC", "300"))
 
-FLEX_HR_DAILY_SLACK_HOUR = int(os.getenv("FLEX_HR_DAILY_HOUR", "10"))
-FLEX_HR_DAILY_SLACK_MINUTE = int(os.getenv("FLEX_HR_DAILY_MINUTE", "32"))
+FLEX_HR_DAILY_SLACK_HOUR = int(os.getenv("FLEX_HR_DAILY_HOUR", "11"))
+FLEX_HR_DAILY_SLACK_MINUTE = int(os.getenv("FLEX_HR_DAILY_MINUTE", "00"))
 
-FLEX_HR_MONTHLY_UPDATE_HOUR = int(os.getenv("FLEX_HR_MONTHLY_NOON_HOUR", "10"))
-FLEX_HR_MONTHLY_UPDATE_MINUTE = int(os.getenv("FLEX_HR_MONTHLY_NOON_MINUTE", "35"))
+FLEX_HR_MONTHLY_UPDATE_HOUR = int(os.getenv("FLEX_HR_MONTHLY_NOON_HOUR", "11"))
+FLEX_HR_MONTHLY_UPDATE_MINUTE = int(os.getenv("FLEX_HR_MONTHLY_NOON_MINUTE", "00"))
 
-NEWS_DAILY_SLACK_HOUR = int(os.getenv("NEWS_DAILY_SLACK_HOUR", "10"))
-NEWS_DAILY_SLACK_MINUTE = int(os.getenv("NEWS_DAILY_SLACK_MINUTE", "35"))
+# Flex Playwright 세션 주간 갱신 (월=0 … 일=6)
+FLEX_SESSION_REFRESH_WEEKDAY = int(os.getenv("FLEX_SESSION_REFRESH_WEEKDAY", "0"))
+FLEX_SESSION_REFRESH_HOUR = int(os.getenv("FLEX_SESSION_REFRESH_HOUR", "10"))
+FLEX_SESSION_REFRESH_MINUTE = int(os.getenv("FLEX_SESSION_REFRESH_MINUTE", "0"))
+
+NEWS_DAILY_SLACK_HOUR = int(os.getenv("NEWS_DAILY_SLACK_HOUR", "11"))
+NEWS_DAILY_SLACK_MINUTE = int(os.getenv("NEWS_DAILY_SLACK_MINUTE", "00"))
 
 ROOM_REMINDER_POLL_INTERVAL_SEC = int(os.getenv("ROOM_REMINDER_POLL_INTERVAL_SEC", "60"))
 
-MANAGED_ROOM_DAILY_SYNC_HOUR = int(os.getenv("MANAGED_ROOM_DAILY_SYNC_HOUR", "10"))
-MANAGED_ROOM_DAILY_SYNC_MINUTE = int(os.getenv("MANAGED_ROOM_DAILY_SYNC_MINUTE", "40"))
+MANAGED_ROOM_SYNC_POLL_INTERVAL_SEC = int(
+    os.getenv("MANAGED_ROOM_SYNC_POLL_INTERVAL_SEC", "60"),
+)
+MANAGED_ROOM_SYNC_WINDOW_DAYS = int(os.getenv("MANAGED_ROOM_SYNC_WINDOW_DAYS", "7"))
 
 DATA_CLEANUP_RETENTION_DAYS = int(os.getenv("DATA_CLEANUP_RETENTION_DAYS", "10"))
-DATA_CLEANUP_HOUR = int(os.getenv("DATA_CLEANUP_HOUR", "10"))
-DATA_CLEANUP_MINUTE = int(os.getenv("DATA_CLEANUP_MINUTE", "40"))
+DATA_CLEANUP_HOUR = int(os.getenv("DATA_CLEANUP_HOUR", "17"))
+DATA_CLEANUP_MINUTE = int(os.getenv("DATA_CLEANUP_MINUTE", "50"))
+
+
+def _now_kst() -> datetime:
+    return datetime.now(KST)
+
+
+def _coerce_kst(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KST)
+    return dt.astimezone(KST)
 
 
 def _next_scheduled_time(
@@ -131,12 +148,33 @@ def _next_scheduled_time(
     minute: int,
     earliest_date=None,
 ) -> datetime:
+    now = _coerce_kst(now)
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if earliest_date is not None and target.date() < earliest_date:
-        target = datetime.combine(earliest_date, target.time())
+        target = datetime.combine(
+            earliest_date,
+            target.timetz(),
+            tzinfo=KST,
+        )
     if target <= now:
         target += timedelta(days=1)
     return target
+
+
+def _next_weekly_scheduled_time(
+    now: datetime,
+    *,
+    weekday: int,
+    hour: int,
+    minute: int,
+) -> datetime:
+    """다음 weekday(월=0…일=6) hour:minute. 오늘이 해당 요일이고 시각이 지났으면 +7일."""
+    now = _coerce_kst(now)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    days_ahead = (weekday - now.weekday()) % 7
+    if days_ahead == 0 and target <= now:
+        days_ahead = 7
+    return target + timedelta(days=days_ahead)
 
 
 def _next_flex_hr_monthly_scheduled_run(
@@ -144,7 +182,7 @@ def _next_flex_hr_monthly_scheduled_run(
     *,
     earliest_date=None,
 ) -> datetime:
-    now = now or datetime.now()
+    now = now or _now_kst()
     return _next_scheduled_time(
         now,
         hour=FLEX_HR_MONTHLY_UPDATE_HOUR,
@@ -154,7 +192,19 @@ def _next_flex_hr_monthly_scheduled_run(
 
 
 # 2. 비동기 슬랙 앱 (API client) 및 서명 검증
-slack_app = AsyncApp(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+def _create_slack_app() -> AsyncApp:
+    """단일 bot token 모드 — CLIENT_ID/SECRET 시 Bolt OAuth file store 자동 활성화 방지."""
+    saved: dict[str, str] = {}
+    for key in ("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"):
+        if key in os.environ:
+            saved[key] = os.environ.pop(key)
+    try:
+        return AsyncApp(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+    finally:
+        os.environ.update(saved)
+
+
+slack_app = _create_slack_app()
 _slack_signature_verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
 
 app = FastAPI()
@@ -173,6 +223,11 @@ async def startup_event():
     try:
         await init_db()
         logger.info("PostgreSQL 초기화 완료")
+        expected_team = (os.getenv("SLACK_TEAM_ID") or "").strip()
+        if expected_team:
+            n = await fail_queued_slack_jobs_wrong_team(expected_team)
+            if n:
+                logger.info("구 워크스페이스 Slack 잡 %d건 failed 처리", n)
         if os.getenv("BOT_JOB_WORKER_ENABLED", "true").lower() in ("1", "true", "yes"):
             start_bot_job_worker()
             logger.info("bot_jobs 워커 %d개 시작 (PostgreSQL 큐)", BOT_JOB_WORKER_COUNT)
@@ -224,6 +279,15 @@ async def startup_event():
     if os.getenv("FLEX_HR_DAILY_SLACK_ENABLED", "true").lower() in ("1", "true", "yes"):
         asyncio.create_task(_flex_hr_daily_slack_loop())
 
+    if os.getenv("FLEX_SESSION_REFRESH_ENABLED", "true").lower() in ("1", "true", "yes"):
+        asyncio.create_task(_flex_session_refresh_loop())
+        logger.info(
+            "Flex Playwright 세션 주간 갱신 시작 (weekday=%d %02d:%02d)",
+            FLEX_SESSION_REFRESH_WEEKDAY,
+            FLEX_SESSION_REFRESH_HOUR,
+            FLEX_SESSION_REFRESH_MINUTE,
+        )
+
     if os.getenv("ROOM_REMINDER_POLL_ENABLED", "true").lower() in ("1", "true", "yes"):
         asyncio.create_task(_room_reminder_poll_loop(ROOM_REMINDER_POLL_INTERVAL_SEC))
         logger.info("회의실 리마인더 폴링 시작 (interval=%ds)", ROOM_REMINDER_POLL_INTERVAL_SEC)
@@ -231,11 +295,11 @@ async def startup_event():
     if os.getenv("MANAGED_ROOM_SYNC_ENABLED", "true").lower() in ("1", "true", "yes"):
         if os.getenv("MANAGED_ROOM_SYNC_ON_STARTUP", "true").lower() in ("1", "true", "yes"):
             asyncio.create_task(_managed_room_sync_once())
-        asyncio.create_task(_managed_room_daily_sync_loop())
+        asyncio.create_task(_managed_room_poll_loop())
         logger.info(
-            "managed_room_events 일일 동기화 시작 (매일 %02d:%02d KST)",
-            MANAGED_ROOM_DAILY_SYNC_HOUR,
-            MANAGED_ROOM_DAILY_SYNC_MINUTE,
+            "managed_room_events 동기화 시작 (window=%dd, poll=%ds)",
+            MANAGED_ROOM_SYNC_WINDOW_DAYS,
+            MANAGED_ROOM_SYNC_POLL_INTERVAL_SEC,
         )
 
     if os.getenv("NEWS_DAILY_SLACK_ENABLED", "true").lower() in ("1", "true", "yes"):
@@ -260,32 +324,15 @@ async def _managed_room_sync_once() -> None:
 
     try:
         stats = await sync_all_managed_rooms()
-        logger.info("[ManagedRoomSync] startup sync %s", stats)
+        logger.info("[ManagedRoomSync] sync %s", stats)
     except Exception as e:
         logger.error("[ManagedRoomSync] sync failed: %s", e)
 
 
-def _next_managed_room_daily_sync_kst() -> datetime:
-    now = datetime.now(KST)
-    target = datetime.combine(
-        now.date(),
-        datetime.min.time(),
-        tzinfo=KST,
-    ).replace(
-        hour=MANAGED_ROOM_DAILY_SYNC_HOUR,
-        minute=MANAGED_ROOM_DAILY_SYNC_MINUTE,
-    )
-    if target <= now:
-        target += timedelta(days=1)
-    return target
-
-
-async def _managed_room_daily_sync_loop() -> None:
+async def _managed_room_poll_loop() -> None:
+    """4개 회의실 1주일치 Graph → DB 주기 동기화 (기본 10분)."""
     while True:
-        target = _next_managed_room_daily_sync_kst()
-        sleep_sec = max(1.0, (target - datetime.now(KST)).total_seconds())
-        logger.info("[ManagedRoomSync] next daily sync at %s", target.isoformat())
-        await asyncio.sleep(sleep_sec)
+        await asyncio.sleep(MANAGED_ROOM_SYNC_POLL_INTERVAL_SEC)
         await _managed_room_sync_once()
 
 
@@ -384,7 +431,7 @@ async def _flex_hr_monthly_noon_loop() -> None:
     )
 
     while True:
-        now = datetime.now()
+        now = _now_kst()
         today = now.date()
 
         if _flex_hr_monthly_last_run_date == today:
@@ -403,7 +450,7 @@ async def _flex_hr_monthly_noon_loop() -> None:
         )
         await asyncio.sleep(wait_sec)
 
-        today = datetime.now().date()
+        today = _now_kst().date()
         if _flex_hr_monthly_last_run_date == today:
             continue
 
@@ -414,6 +461,85 @@ async def _flex_hr_monthly_noon_loop() -> None:
         except Exception as e:
             logger.error("Flex HR 월간 정기 갱신 실패: %s", e)
 
+
+_flex_session_refresh_last_run_date = None
+
+
+async def _flex_session_refresh_loop() -> None:
+    """
+    Flex Playwright 프로필 쿠키 주간 갱신.
+    - 시작 시 마지막 갱신이 stale이면 1회 실행
+    - 이후 매주 지정 요일·시각에 headful로 Flex를 열어 세션 연장
+    """
+    global _flex_session_refresh_last_run_date
+    from app.services.flex_hr.flex_hr import (
+        flex_session_refresh_stale,
+        run_flex_session_refresh,
+    )
+
+    loop = asyncio.get_event_loop()
+    weekday_names = ("월", "화", "수", "목", "금", "토", "일")
+    wd = max(0, min(6, FLEX_SESSION_REFRESH_WEEKDAY))
+    logger.info(
+        "Flex 세션 주간 갱신 시각: %s요일 %02d:%02d",
+        weekday_names[wd],
+        FLEX_SESSION_REFRESH_HOUR,
+        FLEX_SESSION_REFRESH_MINUTE,
+    )
+
+    if os.getenv("FLEX_SESSION_REFRESH_ON_STARTUP", "true").lower() in ("1", "true", "yes"):
+        if flex_session_refresh_stale():
+            try:
+                report = await loop.run_in_executor(None, run_flex_session_refresh)
+                logger.info("Flex 세션 시작 시 갱신 완료: %s", report)
+                if report.get("ok"):
+                    _flex_session_refresh_last_run_date = _now_kst().date()
+            except Exception as e:
+                logger.error("Flex 세션 시작 시 갱신 실패: %s", e)
+        else:
+            logger.info("Flex 세션 최근 갱신됨 — 시작 시 스킵")
+
+    while True:
+        now = _now_kst()
+        today = now.date()
+        if _flex_session_refresh_last_run_date == today and now.weekday() == wd:
+            next_run = _next_weekly_scheduled_time(
+                now + timedelta(days=1),
+                weekday=wd,
+                hour=FLEX_SESSION_REFRESH_HOUR,
+                minute=FLEX_SESSION_REFRESH_MINUTE,
+            )
+        else:
+            next_run = _next_weekly_scheduled_time(
+                now,
+                weekday=wd,
+                hour=FLEX_SESSION_REFRESH_HOUR,
+                minute=FLEX_SESSION_REFRESH_MINUTE,
+            )
+
+        wait_sec = max(1.0, (next_run - now).total_seconds())
+        logger.info(
+            "Flex 세션 다음 갱신 예정: %s (%.0fs 후)",
+            next_run.isoformat(),
+            wait_sec,
+        )
+        await asyncio.sleep(wait_sec)
+
+        today = _now_kst().date()
+        if _flex_session_refresh_last_run_date == today:
+            continue
+        try:
+            report = await loop.run_in_executor(None, run_flex_session_refresh)
+            logger.info("Flex 세션 주간 갱신 완료: %s", report)
+            if report.get("ok"):
+                _flex_session_refresh_last_run_date = today
+            else:
+                logger.warning(
+                    "Flex 세션 갱신 실패(로그인 필요) — 다음 주기에 재시도. report=%s",
+                    report,
+                )
+        except Exception as e:
+            logger.error("Flex 세션 주간 갱신 실패: %s", e)
 
 
 _flex_hr_last_sent_date = None  # date | None — 프로세스 내 하루 1회 전송
@@ -432,7 +558,7 @@ async def _flex_hr_daily_slack_loop() -> None:
     )
 
     while True:
-        now = datetime.now()
+        now = _now_kst()
         today = now.date()
 
         if _flex_hr_last_sent_date == today:
@@ -457,7 +583,7 @@ async def _flex_hr_daily_slack_loop() -> None:
         )
         await asyncio.sleep(wait_sec)
 
-        today = datetime.now().date()
+        today = _now_kst().date()
         if _flex_hr_last_sent_date == today:
             continue
 
@@ -486,7 +612,7 @@ async def _news_daily_slack_loop() -> None:
     )
 
     while True:
-        now = datetime.now()
+        now = _now_kst()
         today = now.date()
 
         if _news_daily_last_sent_date == today:
@@ -511,7 +637,7 @@ async def _news_daily_slack_loop() -> None:
         )
         await asyncio.sleep(wait_sec)
 
-        today = datetime.now().date()
+        today = _now_kst().date()
         if _news_daily_last_sent_date == today:
             continue
 
@@ -542,7 +668,7 @@ async def _gov_pipeline_loop() -> None:
     )
 
     while True:
-        now = datetime.now()
+        now = _now_kst()
         next_run = next_business_day_run(
             now,
             hour=GOV_PIPELINE_HOUR,
@@ -561,7 +687,7 @@ async def _gov_pipeline_loop() -> None:
             logger.info("정부과제 파이프라인 스킵 — %s", skip)
             continue
 
-        target_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        target_date = (_now_kst() - timedelta(days=1)).strftime("%Y-%m-%d")
         try:
             report = await loop.run_in_executor(
                 None,
@@ -732,13 +858,13 @@ async def _data_cleanup_loop() -> None:
     try:
         await loop.run_in_executor(None, run_data_cleanup)
         await run_bot_job_cleanup()
-        _data_cleanup_last_run_date = datetime.now().date()
+        _data_cleanup_last_run_date = _now_kst().date()
     except Exception as e:
         logger.error(f"[DataCleanup] 시작 시 초기 데이터 정리 실패: {e}")
 
     # 2. 매일 지정된 시각에 실행되는 반복 루프
     while True:
-        now = datetime.now()
+        now = _now_kst()
         today = now.date()
 
         if _data_cleanup_last_run_date == today:
@@ -761,7 +887,7 @@ async def _data_cleanup_loop() -> None:
         )
         await asyncio.sleep(wait_sec)
 
-        today = datetime.now().date()
+        today = _now_kst().date()
         if _data_cleanup_last_run_date == today:
             continue
 
@@ -844,22 +970,25 @@ async def process_and_respond(
     channel_id,
     user_id,
     text,
-    thread_ts,
+    session_key,
     *,
     channel_type: str = "",
     files: list | None = None,
+    message_ts: str | None = None,
 ):
     """
     채널에 메시지가 있을 때, 메시지를 처리하고 응답을 보낸다.
+    DM/공용 채널 모두 평면 대화(스레드 미사용).
     """
-    rag_debug_logger.set_session_id(thread_ts)
+    rag_debug_logger.set_session_id(session_key)
     try:
         rag_debug_logger._write("07_slack_io.jsonl", {
             "ts": rag_debug_logger._ts(),
             "type": "input",
             "channel_id": channel_id,
             "user_id": user_id,
-            "thread_ts": thread_ts,
+            "session_key": session_key,
+            "message_ts": message_ts,
             "text": text,
             "files_count": len(files or []),
         })
@@ -869,7 +998,7 @@ async def process_and_respond(
         attachment_bundle: UserAttachmentBundle = await ingest_slack_files(
             files,
             bot_token,
-            session_id=thread_ts,
+            session_id=session_key,
             user_text=text or "",
             submitter=SubmitterInfo(
                 slack_user_id=user_id,
@@ -878,10 +1007,9 @@ async def process_and_respond(
             ),
         )
 
-        # 1. '분석 중' 초기 메시지 (스레드 답변)
+        # 1. '분석 중' 초기 메시지 (채널/DM 평면 답변)
         initial_res = await slack_app.client.chat_postMessage(
             channel=channel_id,
-            thread_ts=thread_ts,
             text="처리 중...",
             blocks=[{
                 "type": "context",
@@ -915,7 +1043,7 @@ async def process_and_respond(
                 db_session = await chat_service.get_or_create_session(
                     user_id=db_user.id,
                     slack_channel_id=channel_id,
-                    slack_thread_ts=thread_ts,
+                    slack_thread_ts=None,
                 )
 
                 # user 메시지 저장
@@ -925,7 +1053,7 @@ async def process_and_respond(
                     role="user",
                     content=text or ("(첨부 파일)" if attachment_bundle.has_content else text),
                     metadata={
-                        "slack_ts": thread_ts,
+                        "slack_ts": message_ts,
                         "channel_id": channel_id,
                         "attachment_ids": attachment_bundle.item_ids(),
                         "attachment_filenames": attachment_bundle.filenames,
@@ -937,7 +1065,7 @@ async def process_and_respond(
                         await chat_service.save_chat_attachments(
                             user_id=db_user.id,
                             session_id=db_session.id,
-                            slack_thread_ts=thread_ts,
+                            slack_thread_ts=None,
                             user_text=text,
                             records=attachment_bundle.to_db_records(user_text=text),
                         )
@@ -970,7 +1098,7 @@ async def process_and_respond(
             )
             answer, docs, intent, source_doc_numbers, links_used_by_doc, attachments_used_by_doc, gov_attachments = await async_agent_chat(
                 text,
-                session_id=thread_ts,
+                session_id=session_key,
                 conversation_history=conversation_history,
                 memory_context=memory_context,
                 session_summary_raw=session_summary_raw,
@@ -988,7 +1116,7 @@ async def process_and_respond(
             rag_debug_logger._write("07_slack_io.jsonl", {
                 "ts": rag_debug_logger._ts(),
                 "type": "agent",
-                "thread_ts": thread_ts,
+                "session_key": session_key,
                 "intent": intent,
             })
 
@@ -1022,7 +1150,7 @@ async def process_and_respond(
                 rag_debug_logger._write("07_slack_io.jsonl", {
                     "ts": rag_debug_logger._ts(),
                     "type": "output_general",
-                    "thread_ts": thread_ts,
+                    "session_key": session_key,
                     "answer": formatted_answer,
                 })
             elif intent.startswith("gov_project"):
@@ -1039,7 +1167,7 @@ async def process_and_respond(
                 rag_debug_logger._write("07_slack_io.jsonl", {
                     "ts": rag_debug_logger._ts(),
                     "type": "output_gov",
-                    "thread_ts": thread_ts,
+                    "session_key": session_key,
                     "answer": formatted_answer,
                     "gov_files_count": len(gov_attachments or []),
                 })
@@ -1057,7 +1185,7 @@ async def process_and_respond(
                 rag_debug_logger._write("07_slack_io.jsonl", {
                     "ts": rag_debug_logger._ts(),
                     "type": "output_rag",
-                    "thread_ts": thread_ts,
+                    "session_key": session_key,
                     "answer": formatted_answer,
                     "docs_count": len(docs) if docs else 0
                 })
@@ -1076,7 +1204,7 @@ async def process_and_respond(
                     await enqueue_post_response_job(
                         user_id=db_user.id,
                         session_id=db_session.id,
-                        conversation_key=f"{channel_id}:{thread_ts}",
+                        conversation_key=session_key,
                         user_msg_id=user_msg.id if user_msg else None,
                         assistant_msg_id=assistant_msg.id if assistant_msg else None,
                         user_text=text,
@@ -1107,7 +1235,7 @@ async def process_and_respond(
             rag_debug_logger._write("07_slack_io.jsonl", {
                 "ts": rag_debug_logger._ts(),
                 "type": "error",
-                "thread_ts": thread_ts,
+                "session_key": session_key,
                 "error_msg": str(e)
             })
 
@@ -1117,7 +1245,7 @@ async def process_and_respond(
                 text="⚠️ 답변 생성 중 오류가 발생했습니다."
             )
     finally:
-        rag_debug_logger.cleanup_session(thread_ts)
+        rag_debug_logger.cleanup_session(session_key)
 
 
 async def run_post_response_tasks(payload: dict) -> None:

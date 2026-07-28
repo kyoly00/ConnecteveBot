@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -10,6 +11,10 @@ from app.services.bot_jobs.constants import JobSource
 from app.services.bot_jobs.queue import enqueue_job
 
 logger = logging.getLogger(__name__)
+
+
+def _expected_slack_team_id() -> str:
+    return (os.getenv("SLACK_TEAM_ID") or "").strip()
 
 
 def should_enqueue_slack_message(event: dict[str, Any]) -> bool:
@@ -26,13 +31,18 @@ def should_enqueue_slack_message(event: dict[str, Any]) -> bool:
     return True
 
 
+def slack_session_key(channel_id: str | None, user_id: str | None) -> str:
+    """DM/채널 평면 대화용 세션 키 (user × channel)."""
+    return f"{(channel_id or '').strip()}:{(user_id or '').strip()}"
+
+
 def slack_conversation_key(
     *,
     team_id: str | None,
     channel_id: str | None,
-    thread_ts: str | None,
+    user_id: str | None,
 ) -> str:
-    return f"{team_id or '-'}:{channel_id or '-'}:{thread_ts or '-'}"
+    return f"{team_id or '-'}:{channel_id or '-'}:{user_id or '-'}"
 
 
 async def enqueue_slack_event_callback(payload: dict[str, Any]) -> bool:
@@ -57,9 +67,18 @@ async def enqueue_slack_event_callback(payload: dict[str, Any]) -> bool:
         return False
 
     team_id = str(payload.get("team_id") or event.get("team") or "").strip() or None
+    expected_team = _expected_slack_team_id()
+    if expected_team and team_id and team_id != expected_team:
+        logger.info(
+            "[SlackIngress] ignore other workspace team=%s expected=%s event_id=%s",
+            team_id,
+            expected_team,
+            event_id,
+        )
+        return False
+
     channel_id = str(event.get("channel") or "").strip() or None
     user_id = str(event.get("user") or "").strip() or None
-    thread_ts = str(event.get("thread_ts") or event.get("ts") or "").strip() or None
     event_ts = str(event.get("ts") or "").strip() or None
 
     created, _ = await enqueue_job(
@@ -69,12 +88,12 @@ async def enqueue_slack_event_callback(payload: dict[str, Any]) -> bool:
         team_id=team_id,
         channel_id=channel_id,
         user_id=user_id,
-        thread_ts=thread_ts,
+        thread_ts=None,
         event_ts=event_ts,
         conversation_key=slack_conversation_key(
             team_id=team_id,
             channel_id=channel_id,
-            thread_ts=thread_ts,
+            user_id=user_id,
         ),
         payload=payload,
     )
@@ -94,9 +113,17 @@ async def enqueue_slack_slash_command(body: bytes) -> bool:
         return False
 
     team_id = str(form.get("team_id") or "").strip() or None
+    expected_team = _expected_slack_team_id()
+    if expected_team and team_id and team_id != expected_team:
+        logger.info(
+            "[SlackIngress] ignore slash other workspace team=%s expected=%s",
+            team_id,
+            expected_team,
+        )
+        return False
+
     channel_id = str(form.get("channel_id") or "").strip() or None
     user_id = str(form.get("user_id") or "").strip() or None
-    thread_ts = str(form.get("thread_ts") or form.get("ts") or "").strip() or None
 
     created, _ = await enqueue_job(
         source=JobSource.SLACK,
@@ -105,12 +132,12 @@ async def enqueue_slack_slash_command(body: bytes) -> bool:
         team_id=team_id,
         channel_id=channel_id,
         user_id=user_id,
-        thread_ts=thread_ts,
+        thread_ts=None,
         event_ts=str(form.get("ts") or "").strip() or None,
         conversation_key=slack_conversation_key(
             team_id=team_id,
             channel_id=channel_id,
-            thread_ts=thread_ts,
+            user_id=user_id,
         ),
         payload=form,
     )

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
@@ -55,6 +56,7 @@ __all__ = [
     "save_flex_hr_monthly_json",
     "run_flex_hr_pipeline",
     "run_flex_hr_monthly_pipeline",
+    "refresh_flex_playwright_session",
     "is_daily_html",
     "is_monthly_html",
 ]
@@ -141,13 +143,44 @@ def _looks_like_login_page(page) -> bool:
     return False
 
 
-def _ensure_flex_session(page, *, profile_dir: Path) -> None:
+def _wait_until_flex_logged_in(page, *, wait_sec: int, poll_sec: float = 2.0) -> bool:
+    """
+    로그인 화면이 사라질 때까지 폴링. 로그인 완료 즉시 True.
+    타임아웃이면 False (전체 wait_sec를 무조건 잠들지 않음).
+    """
+    if wait_sec <= 0:
+        return not _looks_like_login_page(page)
+
+    deadline = time.monotonic() + wait_sec
+    poll_ms = max(500, int(poll_sec * 1000))
+    print(f"  최대 {wait_sec}초 대기 — 로그인 완료되면 바로 진행합니다")
+
+    while time.monotonic() < deadline:
+        try:
+            if not _looks_like_login_page(page):
+                print("  로그인 완료 감지")
+                return True
+            page.wait_for_timeout(poll_ms)
+        except Exception as e:
+            print(f"  로그인 대기 중 중단: {e}")
+            return False
+
+    still_login = _looks_like_login_page(page)
+    if still_login:
+        print("  로그인 대기 시간 초과 — 아직 로그인 화면입니다")
+        return False
+    print("  로그인 완료 감지")
+    return True
+
+
+def _ensure_flex_session(page, *, profile_dir: Path, force: bool = False) -> None:
+    """프로필 세션 확인. force=True면 로그인 화면 대기까지 강제."""
     wait_sec = int(os.getenv("FLEX_LOGIN_WAIT_SEC", "0") or "0")
     first_profile = not profile_dir.exists() or not any(profile_dir.iterdir())
+    ensure_login = os.getenv("FLEX_ENSURE_LOGIN", "").lower() in ("1", "true", "yes")
 
-    if wait_sec <= 0 and not first_profile:
-        if os.getenv("FLEX_ENSURE_LOGIN", "").lower() not in ("1", "true", "yes"):
-            return
+    if not force and wait_sec <= 0 and not first_profile and not ensure_login:
+        return
 
     login_url = os.getenv("FLEX_LOGIN_URL", FLEX_URL or "").strip()
     if not login_url:
@@ -164,9 +197,11 @@ def _ensure_flex_session(page, *, profile_dir: Path) -> None:
         wait_sec = int(os.getenv("FLEX_LOGIN_WAIT_ON_AUTH", "180") or "180")
         print(f"  로그인 화면 감지 — 최대 {wait_sec}초 대기")
 
-    if wait_sec > 0:
-        print(f"  {wait_sec}초 대기 중… (로그인 완료 후 자동 진행)")
-        page.wait_for_timeout(wait_sec * 1000)
+    if wait_sec > 0 and _looks_like_login_page(page):
+        _wait_until_flex_logged_in(page, wait_sec=wait_sec)
+    elif wait_sec > 0:
+        # 강제 대기만 요청된 경우(이미 로그인) — 짧게 settle
+        page.wait_for_timeout(min(wait_sec, 3) * 1000)
 
 
 def _scroll_flex_timeline(page) -> None:
@@ -226,10 +261,85 @@ def _launch_flex_page(target_url: str, *, monthly: bool):
 
     page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
     if _looks_like_login_page(page):
-        _ensure_flex_session(page, profile_dir=profile_dir)
+        _ensure_flex_session(page, profile_dir=profile_dir, force=True)
         page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
 
     return playwright, context, page
+
+
+def refresh_flex_playwright_session() -> dict:
+    """
+    Flex 프로필 쿠키 주기 갱신 (호출측에서 flex_playwright_session으로 직렬화).
+
+    이미 로그인된 세션이면 페이지를 열어 settle 후 종료한다.
+    로그인 화면이면 headful 대기(FLEX_LOGIN_WAIT_ON_AUTH)로 수동 로그인을 받는다.
+    """
+    from playwright.sync_api import sync_playwright
+
+    login_url = os.getenv("FLEX_LOGIN_URL", FLEX_URL or "").strip()
+    if not login_url:
+        raise ValueError("FLEX_URL 또는 FLEX_LOGIN_URL이 필요합니다.")
+
+    profile_dir = Path(
+        os.getenv("FLEX_PLAYWRIGHT_PROFILE_DIR", str(FLEX_PLAYWRIGHT_PROFILE_DIR))
+    ).resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    # 세션 갱신은 기본 headful (만료 시 수동 로그인 가능)
+    headless = os.getenv("FLEX_SESSION_REFRESH_HEADLESS", "false").lower() in (
+        "1", "true", "yes",
+    )
+    settle_sec = int(os.getenv("FLEX_SESSION_REFRESH_SETTLE_SEC", "20") or "20")
+    auth_wait = int(os.getenv("FLEX_LOGIN_WAIT_ON_AUTH", "300") or "300")
+
+    print(
+        f"[Flex SessionRefresh] 시작 url={login_url} "
+        f"headless={headless} profile={profile_dir}"
+    )
+
+    playwright = sync_playwright().start()
+    context = None
+    try:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=headless,
+            user_agent=PLAYWRIGHT_USER_AGENT,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(login_url, wait_until="domcontentloaded", timeout=120000)
+
+        needed_login = _looks_like_login_page(page)
+        if needed_login:
+            print(
+                f"[Flex SessionRefresh] 로그인 화면 감지 — "
+                f"최대 {auth_wait}초 대기 (창에서 로그인, 완료 시 즉시 진행)"
+            )
+            logged_in = _wait_until_flex_logged_in(page, wait_sec=auth_wait)
+            if logged_in:
+                try:
+                    page.goto(login_url, wait_until="domcontentloaded", timeout=120000)
+                except Exception as e:
+                    print(f"[Flex SessionRefresh] 로그인 후 재접속 경고: {e}")
+            logged_in = not _looks_like_login_page(page)
+        else:
+            if settle_sec > 0:
+                print(f"[Flex SessionRefresh] 세션 유지 확인 — {settle_sec}초 settle")
+                page.wait_for_timeout(settle_sec * 1000)
+            logged_in = not _looks_like_login_page(page)
+
+        result = {
+            "ok": logged_in,
+            "needed_login": needed_login,
+            "logged_in": logged_in,
+            "refreshed_at": now_iso(),
+            "profile_dir": str(profile_dir),
+        }
+        print(f"[Flex SessionRefresh] 완료: {result}")
+        return result
+    finally:
+        if context is not None:
+            context.close()
+        playwright.stop()
 
 
 def _close_flex_page(playwright, context) -> None:

@@ -1,11 +1,14 @@
 """
-managed_room_sync — Graph webhook·일일 전체 동기화·subscription 관리.
+managed_room_sync — Graph API ↔ managed_room_events DB 동기화.
 
-JSON 이벤트 캐시 없음. managed_room_events DB만 갱신.
+- 4개 회의실 × 1주일 calendarView → DB upsert
+- 주기 폴링(기본 10분)으로 변경 추적
+- 조회 시 DB·API 교차 검증 (불일치 시 API 기준으로 DB 보정)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,8 +29,10 @@ from app.services.outlook_room import ms_graph_room as graph
 from app.services.outlook_room.managed_room_events import (
     delete_by_room_event,
     event_in_retention_window,
+    event_to_graph_dict,
+    list_events_for_room_day,
     purge_outside_retention,
-    retention_window,
+    sync_window,
     upsert_from_graph_event,
 )
 
@@ -35,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 GRAPH_SUBSCRIPTION_URL = "https://graph.microsoft.com/v1.0/subscriptions"
 _MANAGED_ROOM_EMAILS = set(e.lower() for e in graph.ROOM_EMAIL_MAP.values())
+SYNC_POLL_INTERVAL_SEC = int(os.getenv("MANAGED_ROOM_SYNC_POLL_INTERVAL_SEC", "600"))
 
 
 def _now_iso() -> str:
@@ -117,7 +123,7 @@ def collect_room_events_for_window(
     start_date: date,
     end_date_exclusive: date,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """3개 회의실 Graph 조회."""
+    """4개 회의실 Graph calendarView 조회."""
     out: list[tuple[str, dict[str, Any]]] = []
     for room_email in graph.ROOM_EMAIL_MAP.values():
         events = graph.fetch_calendar_events_with_details_between(
@@ -133,11 +139,11 @@ def collect_room_events_for_window(
 
 async def sync_all_managed_rooms(*, reference: date | None = None) -> dict[str, int]:
     """
-    전체 동기화 — retention 윈도우 내 이벤트 upsert, 누락분 삭제, 기간 밖 purge.
+    전체 동기화 — 1주일 윈도우 내 이벤트 upsert, 누락분 삭제, 기간 밖 purge.
 
     Returns stats dict.
     """
-    start, end_exclusive = retention_window(reference)
+    start, end_exclusive = sync_window(reference)
     headers = graph.build_api_headers(graph.get_valid_app_token())
     fetched = collect_room_events_for_window(
         headers,
@@ -204,6 +210,160 @@ async def sync_all_managed_rooms(*, reference: date | None = None) -> dict[str, 
         "window_start": start.isoformat(),
         "window_end_exclusive": end_exclusive.isoformat(),
     }
+
+
+def _event_snapshot(event_id: str, start: str, end: str, subject: str) -> tuple[str, str, str, str]:
+    return (
+        event_id.strip(),
+        start[:16],
+        end[:16],
+        (subject or "").strip().lower()[:120],
+    )
+
+
+def _api_event_snapshots(api_events: list[dict]) -> dict[str, tuple[str, str, str, str]]:
+    out: dict[str, tuple[str, str, str, str]] = {}
+    for event in api_events:
+        eid = str(event.get("id") or "").strip()
+        if not eid:
+            continue
+        start, end = graph._event_bounds(event)
+        subj = str(event.get("subject") or "")
+        out[eid] = _event_snapshot(eid, start, end, subj)
+    return out
+
+
+def _db_event_snapshots(db_rows: list[Any]) -> dict[str, tuple[str, str, str, str]]:
+    out: dict[str, tuple[str, str, str, str]] = {}
+    for row in db_rows:
+        eid = str(row.outlook_event_id or "").strip()
+        if not eid or eid.startswith("pending:"):
+            continue
+        out[eid] = _event_snapshot(
+            eid,
+            str(row.start_time or ""),
+            str(row.end_time or ""),
+            str(row.event_subject or row.subject or ""),
+        )
+    return out
+
+
+def room_day_events_match(db_rows: list[Any], api_events: list[dict]) -> bool:
+    """해당 날짜 DB·API 이벤트 스냅샷이 일치하는지."""
+    return _db_event_snapshots(db_rows) == _api_event_snapshots(api_events)
+
+
+async def reconcile_room_day_from_api(
+    room_email: str,
+    target: date,
+    api_events: list[dict],
+) -> int:
+    """API 스냅샷 기준으로 해당 날짜 DB projection을 맞춘다."""
+    room = room_email.strip().lower()
+    api_by_id = {
+        str(e.get("id") or "").strip(): e
+        for e in api_events
+        if str(e.get("id") or "").strip()
+    }
+    db_rows = await list_events_for_room_day(room, target)
+
+    upserted = 0
+    for event in api_by_id.values():
+        if graph.event_is_private(event):
+            continue
+        row = await upsert_from_graph_event(room, event)
+        if row:
+            upserted += 1
+
+    for row in db_rows:
+        eid = str(row.outlook_event_id or "").strip()
+        if not eid or eid.startswith("pending:"):
+            continue
+        if eid not in api_by_id:
+            await delete_by_room_event(room, eid)
+
+    return upserted
+
+
+def _fetch_live_room_events_for_day_sync(
+    room_email: str,
+    target: date,
+) -> list[dict]:
+    headers = graph.build_api_headers(graph.get_valid_app_token())
+    events = graph.fetch_calendar_events_with_details(
+        headers,
+        room_email,
+        day=target,
+    )
+    return [e for e in events if not graph.event_is_private(e)]
+
+
+async def fetch_verified_room_events_for_day(
+    room_email: str,
+    target: date,
+    *,
+    room_display: str = "",
+) -> tuple[list[dict], list[dict], str]:
+    """
+    DB·Graph API를 모두 조회해 검증한다.
+
+    Returns
+    -------
+    (graph_event_dicts, api_events, verification_note)
+    불일치 시 API 기준으로 DB를 보정한 뒤 최신 DB를 반환한다.
+    """
+    db_rows = await list_events_for_room_day(room_email, target)
+    loop = asyncio.get_running_loop()
+    try:
+        api_events = await loop.run_in_executor(
+            None,
+            _fetch_live_room_events_for_day_sync,
+            room_email,
+            target,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[ManagedRoomSync] live API fetch failed room=%s day=%s",
+            room_email,
+            target,
+        )
+        events = [event_to_graph_dict(r) for r in db_rows]
+        return events, [], f"⚠️ Outlook API 조회 실패 — DB 캐시만 사용 ({exc})"
+
+    label = room_display or room_email
+    if room_day_events_match(db_rows, api_events):
+        logger.info(
+            "[ManagedRoomSync] verify OK %s %s db=%d api=%d",
+            label,
+            target,
+            len(db_rows),
+            len(api_events),
+        )
+        return [event_to_graph_dict(r) for r in db_rows], api_events, "✅ DB↔Outlook 일치"
+
+    db_snap = _db_event_snapshots(db_rows)
+    api_snap = _api_event_snapshots(api_events)
+    only_db = sorted(set(db_snap) - set(api_snap))
+    only_api = sorted(set(api_snap) - set(db_snap))
+    changed = sorted(
+        eid for eid in db_snap.keys() & api_snap.keys()
+        if db_snap[eid] != api_snap[eid]
+    )
+    logger.warning(
+        "[ManagedRoomSync] verify MISMATCH %s %s only_db=%s only_api=%s changed=%s",
+        label,
+        target,
+        only_db,
+        only_api,
+        changed,
+    )
+    await reconcile_room_day_from_api(room_email, target, api_events)
+    db_rows = await list_events_for_room_day(room_email, target)
+    note = (
+        "⚠️ DB↔Outlook 불일치 → API 기준으로 재동기화 "
+        f"(db_only={len(only_db)}, api_only={len(only_api)}, changed={len(changed)})"
+    )
+    return [event_to_graph_dict(r) for r in db_rows], api_events, note
 
 
 def load_subscriptions() -> dict[str, Any]:

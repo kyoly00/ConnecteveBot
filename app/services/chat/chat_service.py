@@ -88,18 +88,18 @@ async def get_or_create_session(
     channel = (slack_channel_id or "").strip() or None
     thread = (slack_thread_ts or "").strip() or None
 
-    if channel and thread:
+    if channel:
         async with get_db_session() as session:
-            stmt = (
-                select(ChatSession)
-                .where(and_(
-                    ChatSession.user_id == user_id,
-                    ChatSession.slack_channel_id == channel,
-                    ChatSession.slack_thread_ts == thread,
-                    ChatSession.status == "active",
-                ))
-                .limit(1)
-            )
+            conditions = [
+                ChatSession.user_id == user_id,
+                ChatSession.slack_channel_id == channel,
+                ChatSession.status == "active",
+            ]
+            if thread:
+                conditions.append(ChatSession.slack_thread_ts == thread)
+            else:
+                conditions.append(ChatSession.slack_thread_ts.is_(None))
+            stmt = select(ChatSession).where(and_(*conditions)).limit(1)
             result = await session.execute(stmt)
             existing = result.scalar_one_or_none()
             if existing:
@@ -108,7 +108,7 @@ async def get_or_create_session(
     async with get_db_session() as session:
         new_session = ChatSession(
             user_id=user_id,
-            session_type="slack_thread" if channel and thread else "manual",
+            session_type="slack_thread" if channel and thread else "slack_channel",
             slack_channel_id=channel,
             slack_thread_ts=thread,
         )

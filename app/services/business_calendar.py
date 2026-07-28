@@ -45,9 +45,13 @@ def next_business_day_run(
 ) -> datetime:
     """다음 실행 시각 — 주말·공휴일은 건너뛴다."""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(KST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    else:
+        now = now.astimezone(KST)
     if earliest_date and now.date() < earliest_date:
-        now = datetime.combine(earliest_date, datetime.min.time())
+        now = datetime.combine(earliest_date, datetime.min.time(), tzinfo=KST)
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(days=1)

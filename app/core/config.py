@@ -430,14 +430,14 @@ def get_language_instruction(*, answer_tag_only: bool = False) -> str:
             "- 참조 컨텍스트(사내 위키·정부과제 공고 등)가 한국어라도, <answer> 본문은 사용자 질문 언어로 번역·요약하여 답한다.\n"
             "- 언어 규칙은 <answer> 본문에만 적용한다. <sources_used>·<links_used>·<attachments_used> 태그와 그 안의 숫자, "
             "XML 태그명 자체는 절대 번역·변경하지 않고 형식 그대로 출력한다.\n"
-            "- Flex, ConnBot 등 사내 고유명·시스템명은 억지로 번역하지 않고 원어 그대로 유지한다.\n"
+            "- Flex, CornBot 등 사내 고유명·시스템명은 억지로 번역하지 않고 원어 그대로 유지한다.\n"
             "</lang_instructions>\n"
         )
     return (
         "<lang_instructions priority>\n"
-        "- ConnBot은 사용자가 질문에 사용한 언어를 동적으로 감지하여, 반드시 '동일한 언어'로 답변을 작성한다.\n"
+        "- CornBot은 사용자가 질문에 사용한 언어를 동적으로 감지하여, 반드시 '동일한 언어'로 답변을 작성한다.\n"
         "- 참조 컨텍스트(사내 위키·정부과제 공고 등)가 한국어라도, 사용자가 질문한 언어로 문맥을 유지한 채 번역·요약하여 답한다.\n"
-        "- Flex, ConnBot 등 사내 고유명·시스템명은 억지로 번역하지 않고 원어 그대로 유지한다.\n"
+        "- Flex, CornBot 등 사내 고유명·시스템명은 억지로 번역하지 않고 원어 그대로 유지한다.\n"
         "</lang_instructions>\n"
     )
 
@@ -561,19 +561,24 @@ def get_routing_policy() -> str:
         "- [wiki 우선] 출장·외근·근무 규칙·조직 구성·휴가·복지·총무·IT·보안·자산·시스템 사용법\n"
         "- [wiki 우선] 정부과제의 사내 운영·정산·전자연구노트·양식·신청서·등록 위치·담당자·마감\n"
         "- [첨부 예외] 첨부 업로드·증빙 분류·파일 보관만 요청하면 archive_expense_attachment 우선\n"
-        "- [Flex 예외] 당일/월간 실시간 근태·출근·퇴근·재택·휴가 조회는 search_worker_schedule 우선\n"
-        "- [회의실 예외] 회의실 예약·조회·변경·취소는 manage_room_schedule 우선\n"
+        "- [Flex 예외] 당일/월간 실시간 근태·출근·퇴근·재택·휴가 조회·전체 근태 현황은 search_worker_schedule 우선\n"
+        "- [회의실 예외] 회의실 예약·조회·변경·취소·타인 회의실 일정은 manage_room_schedule 우선\n"
+        "- [Outlook 예외] 본인 Outlook 전체 일정 조회·생성·변경·취소(회의실 없이)는 manage_personal_schedule 우선\n"
         "- [외부 공고 예외] 외부 정부과제 공고 검색·브리핑은 query_gov_projects 우선\n"
         
         "[follow-up 처리]\n"
         "새 질문에 다른 도메인 단서가 **명시**되어 있으면 현재 질문의 도메인을 우선한다.\n"
-        "새 질문이 생략형 follow-up이면 직전 턴의 **tool·domain·action**을 유지하고, 현재 질문에서 새로 언급된 슬롯만 갱신한다.\n"
-        "생략형 follow-up은 이름만 바뀐 질문, 기간만 바뀐 질문, 대상만 짧게 바뀐 질문을 포함한다.\n"
+        "새 질문이 생략형 follow-up이면 직전 턴의 **tool·domain·action**을 유지하고, "
+        "현재 질문에서 새로 언급된 슬롯만 갱신한다.\n"
+        "생략형 follow-up은 이름만 바뀐 질문, 기간만 바뀐 질문, 대상만 짧게 바뀐 질문, "
+        "도메인만 바뀐 짧은 질문(예: '근무 일정은?', '근태는?', '회의는?')을 포함한다.\n"
+        "도메인만 바뀐 생략형이면 conversation_context의 **사람·날짜**를 새 tool 인자로 이어 받고 "
+        "respond_general로 이름을 되묻지 않는다.\n"
         "사람 이름만 있는 질문은 도메인 전환 단서로 보지 않는다.\n\n"
 
         "[금지]\n"
         "- 생략형 follow-up이 아닌데 직전 도메인을 억지로 유지하는 것. 현재 질문 우선.\n"
-        "- 맥락이 있는데 respond_general로 되묻는 것.\n"
+        "- 맥락에 사람·대상이 있는데 respond_general로 되묻는 것.\n"
         "- 사람 이름만 보고 근태 조회로 전환하는 것.\n\n"
 
         "Turn1에서 바로 실행, 재확인 질문 금지\n"
@@ -592,13 +597,23 @@ def get_turn1_routing_instruction() -> str:
         "첨부 있으면 `<turn1_attachment_policy>`대로 content에 `<attachment_policy>` JSON만 "
         "(business tool_call과 병렬).\n\n"
         "[query_gov_projects] detail/files idx = list·대화 [idx] 정수 (카드 1.2. 순번 아님)\n"
-        "[search_worker_schedule] follow-up '이번 달은?': worker_name 유지, year_month만 갱신. "
-        "생략형('OOO님은?'): 직전과 같은 범위·직원. "
+        "[search_worker_schedule] 전체 현황('오늘 근태'·'휴가자'·'재택인'·'전체 근무'): "
+        "all_workers=true (worker_name 비움). "
+        "특정일 브리핑('내일 휴가자'·'7/15 재택인'·'모레 외근자'): "
+        "all_workers=true + date=YYYY-MM-DD. "
+        "follow-up '이번 달은?': worker_name 유지, year_month만 갱신. "
+        "생략형('OOO님은?'·'근무 일정은?'·'근태는?'): conversation_context의 사람 유지, "
+        "당일이면 date 생략. "
         "date+end_date 주간은 **직전 맥락이 근태일 때만**\n"
         "[manage_room_schedule] book subject 생략 가능('회의'). "
-        "list: person_name 생략=본인, 타인은 person_name(예: 소연). 이번 주·다음 주는 date+end_date. "
+        "list: person_name 생략=본인, 타인은 person_name(예: 소연) — **회의실 일정만**. "
+        "이번 주·다음 주는 date+end_date. "
         "cancel/modify/replace/set_reminder: booking_id 없으면 room/date/subject 힌트. "
         "list(참석 조회)에는 쓰기 action 불가\n"
+        "[manage_personal_schedule] 본인 Outlook 전체('내 일정'·'내일 미팅'·회의실 없는 일정 생성). "
+        "list: date 또는 date+end_date. create: start_time 필수. "
+        "modify/cancel: event_id 또는 subject+date/start_time. "
+        "회의실명 있으면 manage_room_schedule\n"
         "[archive_expense_attachment] vs respond_general: "
         "증빙 업로드·분류+첨부 vs 첨부 내용 설명·요약만\n"
         "</turn1_routing>\n"
@@ -641,6 +656,7 @@ def format_turn1_reroute_review(
         "gov": "정부·지원사업 브리핑 (query_gov_projects / 사내 운영은 search_company_wiki)",
         "flex": "Flex 근태 (search_worker_schedule)",
         "room": "회의실·예약 (manage_room_schedule)",
+        "personal": "본인 Outlook 일정 (manage_personal_schedule)",
         "wiki": "사내 위키·규정 (search_company_wiki)",
     }
     lines = [
@@ -753,6 +769,12 @@ def get_rag_planner_final_instructions() -> str:
         "- 관련 page가 없거나 주제가 다르면 → need_external_search\n"
         "- 핵심 엔티티가 snippet에 없으면 answerable 금지\n"
         "</entity_check>\n\n"
+        "<meta_query_fallback>\n"
+        "현재 질문이 '위키 검색해 줘'·'검색해서 알려줘' 등 **도구 지시형(메타성)**이면, "
+        "conversation_context의 직전 user 질문에서 핵심 엔티티를 추출해 "
+        "answerable/parent 선택 판단에 사용한다.\n"
+        "page_title·section_title이 직전 질문의 주제와 가장 관련 높은 snippet을 우선 선택한다.\n"
+        "</meta_query_fallback>\n\n"
         "<decisions>\n"
         "- answerable: snippet만으로 Turn3 답변 가능\n"
         "- need_parent_expansion: page는 맞으나 같은 page 인접 섹션·표·부록 필요 "
@@ -770,6 +792,19 @@ def get_rag_planner_final_instructions() -> str:
     )
 
 
+def get_rag_owner_contacts_instruction() -> str:
+    """RAG Turn3 — 사내 문의 담당자 안내."""
+    return (
+        "<owner_contacts>\n"
+        "사내 문의 담당자 (문서에 담당자가 없거나 추가 확인이 필요할 때 참고):\n"
+        "- 인사/총무: 이주형, 이선애\n"
+        "- 재무/정부과제: 이승완, 김민주, 이소연\n"
+        "- 챗봇 관련: 이소연\n"
+        "- 담당자를 안내할 때는 위 목록만 사용한다. 임의로 담당자를 지어내지 않는다.\n"
+        "</owner_contacts>\n"
+    )
+
+
 def get_router_rag_final_instruction(
     query: str,
     has_docs: bool,
@@ -780,6 +815,7 @@ def get_router_rag_final_instruction(
 ) -> str:
     """Turn3 — evidence planner가 확정한 근거로 최종 답변."""
     memory_block = f"\n\n{memory_context}" if memory_context else ""
+    owner_contacts = get_rag_owner_contacts_instruction()
 
     dependency_block = (
         "<dependency_chain>\n"
@@ -851,6 +887,8 @@ def get_router_rag_final_instruction(
             + dependency_block
             + auxiliary_block
             + grounding_block
+            + owner_contacts
+            + "\n"
             + get_no_hedging_instructions()
             + (get_attachment_citation_instructions() if has_docs else "")
             + ("\n" if has_docs else "")
@@ -870,7 +908,10 @@ def get_router_rag_final_instruction(
         "- 회사 정보 질문: 관련 사내 문서를 찾지 못했음을 정직히 안내. 규정·수치 추측 금지.\n"
         "- 일반 지식 질문: LLM 일반 지식으로 답변.\n"
         "- 혼합 질문: 회사 정보는 '문서 없음', 일반 지식은 LLM으로 구분 답변.\n"
+        "- 추가 확인이 필요하면 <owner_contacts>의 담당자를 안내한다.\n"
         "</search_failure>\n\n"
+        + owner_contacts
+        + "\n"
         + get_no_hedging_instructions()
         + memory_block
         + get_slack_format_instructions()
@@ -886,7 +927,7 @@ def get_router_general_final_instruction(
     memory_block = f"\n\n{memory_context}" if memory_context else ""
     return (
         "<assistant_role>\n"
-        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
         "respond_general 분류 질문에 **존댓말로** 답변한다.\n"
         "</assistant_role>\n\n"
         f"기준 시각: {now_iso()} (Asia/Seoul)\n\n"
@@ -924,28 +965,38 @@ def get_router_flex_final_instruction(
     if has_context:
         return (
             "<assistant_role>\n"
-            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
             "Flex 근태 데이터(search_worker_schedule) 결과를 바탕으로 "
             "직원의 근무·재택·휴가·외근·출장 현황을 **존댓말로** 답변한다.\n"
             "</assistant_role>\n\n"
-            f"기준 시각: {now_iso()} (Asia/Seoul)\n\n"
+            f"기준 시각(벽시계): {now_iso()} (Asia/Seoul)\n\n"
             "<grounding_rules>\n"
             "- worker_schedule_results에 있는 일정만 근거로 사용한다. 임의 추측 금지.\n"
+            "- **데이터 기준일**: 결과 헤더의 '데이터 기준일'·각 블록 '날짜'가 이 일정의 날짜다. "
+            "벽시계 '오늘'과 다르면 데이터 기준일로만 답하고, "
+            "'오늘 일정'처럼 질문 날짜로 바꾸지 않는다.\n"
+            "- 헤더의 '수집 시각'(갱신)은 데이터가 언제 긁힌 시각이지, 일정 날짜가 아니다.\n"
             "- '근무'는 사무실 출근, '재택근무'는 재택, '휴가'는 휴가, '외근'은 외부 근무, '출장'은 출장으로 설명한다.\n"
-            "- **당일 조회**: 시작·종료 시각·재실(근무 중) 정보가 있으면 그대로 사용한다.\n"
+            "- **당일 조회**(데이터 기준일 == 벽시계 당일): 시작·종료 시각·재실(근무 중) 정보가 있으면 그대로 사용한다.\n"
             "- **기간·주간 조회**: 조회 범위 헤더의 모든 일별 근태를 사용한다. "
             "여러 월 블록(--- 구분)이 있으면 합쳐서 답한다.\n"
             "- **월간·과거 일별 조회**: 날짜별 근태 유형·duration(예: 8h 2m)을 답한다. "
             "start_time/end_time이 있으면 함께 표기한다. 없으면 시각은 추측하지 않는다.\n"
             "- 휴가에 시작·종료 시각이 있으면 반차·시간 단위 휴가로 설명한다 (예: '오후 4:00~'만 있으면 오후 반차).\n"
-            "- '근무 중' 상태 또는 '현재 근무 중' 표기가 있으면, 시각 구간이 비어 있어도 **지금 사무실에 재실 중**으로 판단해 답한다.\n"
+            "- '근무 중' 상태 또는 '현재 근무 중' 표기가 있으면, 시각 구간이 비어 있어도 **지금 사무실에 재실 중**으로 판단해 답한다 "
+            "(데이터 기준일이 벽시계 당일일 때만).\n"
             "- 누적 근무시간·월 누적 근무시간이 결과에 없으면 언급하지 않는다 (0:00 등 미추적 값도 제외).\n"
             "- 여러 직원을 물었으면 **각 직원별로** 모두 답한다 (--- 구분 블록 참고).\n"
             "- 팀·직무 단위 질문(예: 운영팀 출근, 대표님 재실)은 조회된 **모든 해당 인원**을 빠짐없이 답한다.\n"
+            "- **[전체 근태 현황]** type별 명단이면 해당 type 그룹만 근거로 요약한다. "
+            "시각·누적시간은 결과에 없으니 추측하지 않는다.\n"
+            "- **특정일 근태 브리핑**(재택 근무자·휴가자·외근자·출장자 줄): "
+            "헤더의 데이터 기준일 기준으로 각 줄 명단만 전달한다. 없는 항목은 '없음'으로 답한다.\n"
             "- '출근한 사람'·'사무실에 있는 사람' 질문은 근무(사무실)·근무 중(재실) 상태인 사람만 답한다. "
             "재택·휴가·외근·출장·일정 없음은 제외하거나 별도 구분한다.\n"
             "- 시각이 '(시각 미표기)'로 되어 있어도 해당 상태(근무·재택 등)는 유효한 정보다. 상태값으로 답한다.\n"
-            "- Flex 기준 현재 시각과 일정 구간을 비교해 지금 회사에 있는지 판단한다 (당일 조회만).\n"
+            "- Flex 기준 현재 시각과 일정 구간을 비교해 지금 회사에 있는지 판단한다 "
+            "(데이터 기준일이 벽시계 당일인 조회만).\n"
             "- 일정이 없으면 '등록된 일정 없음'으로 안내한다.\n"
             "</grounding_rules>\n\n"
             + get_no_hedging_instructions()
@@ -955,7 +1006,7 @@ def get_router_flex_final_instruction(
 
     return (
         "<assistant_role>\n"
-        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
         "Flex 근태 데이터를 조회하지 못했거나 해당 직원 일정이 없음을 **존댓말로** 답변한다.\n"
         "</assistant_role>\n\n"
         f"<user_question>\n{query}\n</user_question>\n\n"
@@ -981,7 +1032,7 @@ def get_router_gov_final_instruction(
     if has_context:
         return (
             "<assistant_role>\n"
-            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
             "정부과제·지원사업 브리핑 도구(query_gov_projects) 결과를 바탕으로 "
             "동료가 신청 여부·일정·요건을 빠르게 판단할 수 있게 **존댓말로** 답변한다.\n"
             "</assistant_role>\n\n"
@@ -1005,7 +1056,7 @@ def get_router_gov_final_instruction(
 
     return (
         "<assistant_role>\n"
-        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
         "현재 정부과제 브리핑 데이터가 조회되지 않았거나 매칭 공고가 없다는 사실을 **존댓말로** 답변한다.\n"
         "</assistant_role>\n\n"
         f"<user_question>\n{query}\n</user_question>\n\n"
@@ -1033,7 +1084,7 @@ def get_router_expense_final_instruction(
     if has_context:
         return (
             "<assistant_role>\n"
-            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
             "경비 증빙 OneDrive 업로드(archive_expense_attachment) 결과를 바탕으로 "
             "동료가 어디에 어떤 파일이 저장됐는지 **존댓말로** 안내한다.\n"
             "</assistant_role>\n\n"
@@ -1054,7 +1105,7 @@ def get_router_expense_final_instruction(
 
     return (
         "<assistant_role>\n"
-        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
         "경비 증빙 업로드 tool이 실행되지 않았거나 결과가 비어 있다. "
         "첨부·질문을 바탕으로 **존댓말로** 안내한다.\n"
         "</assistant_role>\n\n"
@@ -1076,18 +1127,27 @@ def get_router_room_final_instruction(
     query: str = "",
 ) -> str:
     """회의실 예약 tool 결과 기반 최종 답변 (Turn2)."""
+    from app.services.outlook_room.managed_room_events import (
+        SYNC_WINDOW_DAYS,
+        format_query_window_label,
+    )
+
     memory_block = f"\n\n{memory_context}" if memory_context else ""
 
     if has_context:
         return (
             "<assistant_role>\n"
-            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
             "회의실 예약 도구(manage_room_schedule) 결과를 바탕으로 "
             "동료가 예약 현황·결과를 빠르게 파악할 수 있게 **존댓말로** 답변한다.\n"
             "</assistant_role>\n\n"
             f"기준 시각: {now_iso()} (Asia/Seoul)\n\n"
             "<grounding_rules>\n"
             "- room_schedule_results·conversation_context에 있는 정보만 근거로 사용한다. 임의 추측 금지.\n"
+            f"- 회의실 **가용·예약(check/check_all/book)** 은 오늘부터 {SYNC_WINDOW_DAYS}일 이내"
+            f"({format_query_window_label()}) 데이터만 제공된다. 범위 밖 날짜는 조회·예약 불가.\n"
+            "- **list(내·타인 회의 일정)** 은 DB에 보관된 기간(과거 최대 10일·미래 7일)까지만 조회된다. "
+            "10일이 지난 과거 일정은 DB에서 삭제되어 조회할 수 없다.\n"
             "- 이번 턴에 tool을 실행하지 않았거나 오류가 있으면 해당 결과만 그대로 안내한다.\n"
             "- check/check_all occupied 결과는 회의실 점유 현황일 뿐이다. "
             "본인 예약 여부·주최자 소유권은 list 결과가 있을 때만 판단한다.\n"
@@ -1148,7 +1208,7 @@ def get_router_room_final_instruction(
 
     return (
         "<assistant_role>\n"
-        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 ConnBot이다.\n"
+        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
         "회의실 예약 도구 결과가 없거나 처리 중 오류가 발생했음을 **존댓말로** 안내한다.\n"
         "</assistant_role>\n\n"
         f"<user_question>\n{query}\n</user_question>\n\n"
@@ -1163,11 +1223,61 @@ def get_router_room_final_instruction(
     )
 
 
+def get_router_personal_final_instruction(
+    *,
+    has_context: bool,
+    memory_context: str = "",
+    query: str = "",
+) -> str:
+    """본인 Outlook 일정 tool 결과 기반 최종 답변 (Turn2)."""
+    memory_block = f"\n\n{memory_context}" if memory_context else ""
+
+    if has_context:
+        return (
+            "<assistant_role>\n"
+            "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
+            "본인 Outlook 일정 도구(manage_personal_schedule) 결과를 바탕으로 "
+            "일정을 빠르게 파악·처리할 수 있게 **존댓말로** 답변한다.\n"
+            "</assistant_role>\n\n"
+            f"기준 시각: {now_iso()} (Asia/Seoul)\n\n"
+            "<grounding_rules>\n"
+            "- personal_schedule_results에 있는 정보만 근거로 사용한다. 임의 추측 금지.\n"
+            "- 이 결과는 **요청자 본인 Outlook 캘린더**다. "
+            "타인 일정·회의실 전용 조회와 섞지 않는다.\n"
+            "- list 결과가 있으면 제목·날짜·시작~종료·장소(있으면)를 목록으로 전달한다.\n"
+            "- list 0건이면 해당 기간에 일정이 없다고만 짧게 답한다. 역질문 금지.\n"
+            "- create/modify/cancel 결과는 tool 결과를 그대로 요약한다.\n"
+            "- **event_id·내부 ID는 사용자에게 노출하지 않는다.** "
+            "일정은 제목·날짜·시간으로 식별해 말한다.\n"
+            "- (비공개) 일정은 상세 제목 없이 비공개·시간만 안내한다.\n"
+            "- 오류·누락 안내는 일반 한국어로 전달한다.\n"
+            "</grounding_rules>\n\n"
+            + get_no_hedging_instructions()
+            + memory_block
+            + get_slack_format_instructions()
+        )
+
+    return (
+        "<assistant_role>\n"
+        "어시스턴트는 코넥티브(Connecteve)의 사내 지식 어시스턴트 CornBot이다.\n"
+        "Outlook 일정 도구 결과가 없거나 처리 중 오류가 발생했음을 **존댓말로** 안내한다.\n"
+        "</assistant_role>\n\n"
+        f"<user_question>\n{query}\n</user_question>\n\n"
+        "<fallback_rules>\n"
+        "- Outlook 일정을 가져오지 못했거나 처리 중 오류가 발생했음을 안내한다.\n"
+        "- 날짜·제목·시각을 다시 알려 달라고 한 문장으로 안내할 수 있다.\n"
+        "</fallback_rules>\n\n"
+        + get_no_hedging_instructions()
+        + memory_block
+        + get_slack_format_instructions()
+    )
+
+
 # chat_sessions.metadata — App Home welcome DM 1회 전송 여부
 SESSION_METADATA_WELCOME_SENT = "welcome_sent"
 
 APP_HOME_GUIDE_TEXT: str = (
-    "*안녕하세요, ConnBot입니다 👋*\n"
+    "*안녕하세요, CornBot입니다 👋*\n"
     "코넥티브 사내 지식 어시스턴트입니다.\n"
     "궁금한 게 있으면 채널 멘션이나 DM으로 바로 물어보세요!\n\n"
     "*📚 현재 제공 기능*\n\n"
@@ -1183,8 +1293,11 @@ APP_HOME_GUIDE_TEXT: str = (
     "*4. 회의실 예약·조회·취소·변경*\n"
     "Spine·Femur·Atlas·코넥홀 회의실을 Outlook으로 예약·조회·취소·변경합니다. "
     "본인 Slack 이메일이 주최자로 등록됩니다.\n"
-    "> 예) `Spine 오늘 2시~3시 예약` / `내 회의실 예약 목록` / `Atlas 1~3시 예약 2~4시로 변경`\n"
-    "*5. 경비 증빙 업로드*\n"
+    "> 예) `Spine 오늘 2시~3시 예약` / `내 회의실 예약 목록` / `Atlas 1~3시 예약 2~4시로 변경`\n\n"
+    "*5. 내 Outlook 일정*\n"
+    "본인 Outlook 캘린더 일정을 조회·등록·변경·취소합니다.\n"
+    "> 예) `내일 내 일정` / `오늘 3시에 미팅 잡아줘` / `방금 만든 미팅 취소해`\n\n"
+    "*6. 경비 증빙 업로드*\n"
     "운영팀에게 전달이 필요한 증빙 서류가 있다면 업로드해드립니다.\n"
     "> 예) `경비 증빙 업로드`\n\n"
 )

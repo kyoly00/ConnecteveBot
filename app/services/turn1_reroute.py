@@ -19,8 +19,19 @@ LOOKUP_TOOL_NAMES: frozenset[str] = frozenset({
     "query_gov_projects",
     "search_worker_schedule",
     "manage_room_schedule",
+    "manage_personal_schedule",
     "archive_expense_attachment",
 })
+
+PERSONAL_SCHEDULE_KEYWORDS: tuple[str, ...] = (
+    "내 일정",
+    "내 미팅",
+    "내 회의",
+    "내 캘린더",
+    "outlook",
+    "아웃룩",
+    "스케줄",
+)
 
 FLEX_SCHEDULE_KEYWORDS: tuple[str, ...] = (
     "근태",
@@ -69,6 +80,9 @@ WIKI_QUERY_KEYWORDS: tuple[str, ...] = (
     "연락망",
     "비상연락망",
     "주소록",
+    "회사 정보",
+    "회사 소개",
+    "우리 회사",
 )
 
 _CURRENT_YEAR_HINTS: tuple[str, ...] = (
@@ -112,6 +126,10 @@ def detect_domain_signals(query: str) -> dict[str, list[str]]:
     room_kws = _matched_keywords(q.lower(), tuple(k.lower() for k in ROOM_KEYWORDS))
     if room_kws or match_room_in_query(q):
         signals["room"] = room_kws or ["회의실"]
+
+    personal_kws = _matched_keywords(q, PERSONAL_SCHEDULE_KEYWORDS)
+    if personal_kws:
+        signals["personal"] = personal_kws
 
     wiki_kws = _matched_keywords(q, WIKI_QUERY_KEYWORDS)
     if wiki_kws:

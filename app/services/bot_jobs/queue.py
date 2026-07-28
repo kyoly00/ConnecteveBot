@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.db.connection import get_db_session
 from app.db.models import BotJob
-from app.services.bot_jobs.constants import JobStatus
+from app.services.bot_jobs.constants import JobSource, JobStatus, PermanentJobError, PERMANENT_SLACK_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -192,9 +192,10 @@ async def fail_job(
     max_attempts: int,
     error_code: str | None = None,
     error_message: str | None = None,
+    retryable: bool = True,
 ) -> str:
-    """실패 처리. attempt 한도 내면 queued+백오프, 초과면 failed."""
-    if attempt_count < max_attempts:
+    """실패 처리. attempt 한도 내면 queued+백오프, 초과·비재시도면 failed."""
+    if retryable and attempt_count < max_attempts:
         next_status = JobStatus.QUEUED
         next_run = _utcnow() + timedelta(seconds=retry_delay_seconds(attempt_count))
     else:
@@ -225,6 +226,41 @@ async def fail_job(
         error_message,
     )
     return next_status
+
+
+async def fail_queued_slack_jobs_wrong_team(expected_team_id: str) -> int:
+    """다른 워크스페이스 Slack 잡을 failed로 정리한다."""
+    expected = (expected_team_id or "").strip()
+    if not expected:
+        return 0
+
+    async with get_db_session() as session:
+        result = await session.execute(
+            update(BotJob)
+            .where(
+                BotJob.source == JobSource.SLACK,
+                BotJob.status == JobStatus.QUEUED,
+                BotJob.team_id.is_not(None),
+                BotJob.team_id != expected,
+            )
+            .values(
+                status=JobStatus.FAILED,
+                locked_by=None,
+                locked_at=None,
+                next_run_at=_utcnow(),
+                error_code="wrong_team",
+                error_message=f"expected team {expected}",
+                updated_at=_utcnow(),
+            )
+        )
+        count = result.rowcount or 0
+    if count:
+        logger.info(
+            "[BotJob] failed %d queued slack jobs (wrong team, expected=%s)",
+            count,
+            expected,
+        )
+    return count
 
 
 async def delete_jobs_by_source(source: str) -> int:

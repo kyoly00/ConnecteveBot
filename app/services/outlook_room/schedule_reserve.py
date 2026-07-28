@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from app.services.date_range import apply_date_range_to_tool_args
 from app.services.outlook_room import ms_graph_room as graph
 from app.services.outlook_room.attendee_resolver import lookup_user_by_name, resolve_attendees
+from app.services.outlook_room.managed_room_sync import fetch_verified_room_events_for_day
 from app.services.outlook_room.managed_room_events import (
     DEFAULT_LIST_RANGE_DAYS,
     delete_event_by_id,
@@ -35,6 +36,7 @@ from app.services.outlook_room.managed_room_events import (
     event_to_graph_dict,
     find_room_outlook_event_id,
     format_event_line as format_booking_line,
+    format_query_window_label,
     is_valid_booking_uuid,
     list_attended_events,
     list_events_for_room_day,
@@ -44,9 +46,12 @@ from app.services.outlook_room.managed_room_events import (
     resolve_owned_event as resolve_owned_booking,
     set_event_reminder as set_booking_reminder,
     slot_conflicts_with_rows,
+    SYNC_WINDOW_DAYS,
     update_event_after_modify as update_room_booking_after_modify,
     upsert_after_bot_book,
     normalize_date_filter,
+    validate_availability_query_date,
+    validate_list_query_range,
 )
 
 logger = logging.getLogger(__name__)
@@ -543,9 +548,16 @@ async def check_room_schedule(
     target = _parse_date(date_str)
     display, room_email = graph.resolve_room(room_name)
 
+    date_err = validate_availability_query_date(target)
+    if date_err:
+        return f"[{display}] {date_err}"
+
     try:
-        db_rows = await list_events_for_room_day(room_email, target)
-        events = [event_to_graph_dict(r) for r in db_rows]
+        events, api_events, _verify_note = await fetch_verified_room_events_for_day(
+            room_email,
+            target,
+            room_display=display,
+        )
 
         if start_time and end_time:
             try:
@@ -561,20 +573,28 @@ async def check_room_schedule(
             if isinstance(normalized, str):
                 return normalized
             start_time, end_time = normalized
-            conflict = slot_conflicts_with_rows(db_rows, start_time, end_time)
+            conflict = graph.slot_conflicts_with_events(
+                api_events or events,
+                start_time,
+                end_time,
+            )
             if conflict:
-                c_start = conflict.start_time[:16].replace("T", " ")
-                c_end = conflict.end_time[11:16]
-                ok, msg = False, (
-                    f"{c_start}~{c_end} '{conflict.event_subject}' 와 겹칩니다."
-                )
+                c_start = str((conflict.get("start") or {}).get("dateTime") or "")[:16].replace("T", " ")
+                c_end = str((conflict.get("end") or {}).get("dateTime") or "")[11:16]
+                subj = str(conflict.get("subject") or "")
+                ok, msg = False, f"{c_start}~{c_end} '{subj}' 와 겹칩니다."
             else:
                 ok, msg = True, ""
             slot = _fmt_slot(start_time, end_time)
             status = "✅ 가용" if ok else f"❌ 불가 ({msg})"
             return f"[{display}] {target.isoformat()} {slot} — {status}"
 
-        logger.info("[RoomSchedule] check %s %s — %d events", display, target, len(events))
+        logger.info(
+            "[RoomSchedule] check %s %s — %d events (verified)",
+            display,
+            target,
+            len(events),
+        )
         return _append_focus_time_hint(
             _room_schedule_text(display, events, target),
             focus_time,
@@ -658,6 +678,17 @@ def extract_list_person_name(query: str, args: dict[str, Any]) -> str | None:
     return names[0] if names else None
 
 
+def should_reroute_list_to_room_check(query: str, args: dict[str, Any]) -> bool:
+    """list + room_name + 조회 대상 인물 없음 → 회의실 점유 조회(check)로 보정."""
+    if str(args.get("action") or "").strip() != "list":
+        return False
+    if not str(args.get("room_name") or "").strip():
+        return False
+    if extract_list_person_name(query, args):
+        return False
+    return True
+
+
 async def list_bookings(
     *,
     user_id: uuid.UUID | None = None,
@@ -677,6 +708,9 @@ async def list_bookings(
     start_date, end_date_exclusive, explicit_day = _parse_query_range(
         date_str, end_date_str
     )
+    range_err = validate_list_query_range(start_date, end_date_exclusive)
+    if range_err:
+        return range_err
     range_label = (
         start_date.isoformat()
         if explicit_day
@@ -800,6 +834,14 @@ async def book_room(
         return time_err, None
 
     display, _ = graph.resolve_room(room_name)
+    try:
+        book_day = date.fromisoformat(start_time[:10])
+    except ValueError:
+        return "시간 형식이 올바르지 않습니다.", None
+    date_err = validate_availability_query_date(book_day)
+    if date_err:
+        return f"[{display}] {date_err}", None
+
     loop = asyncio.get_running_loop()
 
     try:
@@ -1442,6 +1484,10 @@ async def check_all_rooms(
     target = _parse_date(date_str)
     day_iso = target.isoformat()
 
+    date_err = validate_availability_query_date(target)
+    if date_err:
+        return f"[전체 회의실] {date_err}"
+
     slot_mode = bool(start_time and end_time)
     if slot_mode:
         normalized = _normalize_check_slot(start_time or "", end_time or "")
@@ -1455,30 +1501,37 @@ async def check_all_rooms(
     try:
         for display in ROOM_NAMES:
             _, room_email = graph.resolve_room(display.split()[0].lower())
-            db_rows = await list_events_for_room_day(room_email, target)
+            events, api_events, _verify_note = await fetch_verified_room_events_for_day(
+                room_email,
+                target,
+                room_display=display,
+            )
             if slot_mode:
-                conflict = slot_conflicts_with_rows(
-                    db_rows, start_time or "", end_time or "",
+                conflict = graph.slot_conflicts_with_events(
+                    api_events or events,
+                    start_time or "",
+                    end_time or "",
                 )
                 if conflict:
-                    c_start = conflict.start_time[:16].replace("T", " ")
-                    c_end = conflict.end_time[11:16]
-                    ok, msg = False, (
-                        f"{c_start}~{c_end} '{conflict.event_subject}' 와 겹칩니다."
-                    )
+                    c_start = str((conflict.get("start") or {}).get("dateTime") or "")[:16].replace("T", " ")
+                    c_end = str((conflict.get("end") or {}).get("dateTime") or "")[11:16]
+                    subj = str(conflict.get("subject") or "")
+                    ok, msg = False, f"{c_start}~{c_end} '{subj}' 와 겹칩니다."
                 else:
                     ok, msg = True, ""
                 status = "✅ 가용" if ok else f"❌ 불가 ({msg})"
                 lines.append(f"• {display}: {status}")
             else:
-                events = [event_to_graph_dict(r) for r in db_rows]
                 if not events:
                     lines.append(f"• {display}: 예약 없음 (전 시간 사용 가능)")
                 else:
                     lines.append(f"• {display}: {len(events)}건 occupied")
                     for ev in events:
                         lines.append(f"  {_fmt_event(ev)}")
-        return _append_focus_time_hint("\n".join(lines), focus_time if not slot_mode else None)
+        return _append_focus_time_hint(
+            "\n".join(lines),
+            focus_time if not slot_mode else None,
+        )
     except Exception as e:
         logger.exception("[RoomSchedule] check_all 실패: %s", e)
         return f"전체 회의실 조회 중 오류: {e}"
@@ -1876,6 +1929,10 @@ def normalize_room_tool_args(
         person = extract_list_person_name(query, out)
         if person:
             out["person_name"] = person
+        if should_reroute_list_to_room_check(query, out):
+            out["action"] = "check"
+            out.pop("end_date", None)
+            out.pop("person_name", None)
         return out
 
     if action == "book":

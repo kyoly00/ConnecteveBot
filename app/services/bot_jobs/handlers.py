@@ -8,6 +8,7 @@ from typing import Any
 from app.db.models import BotJob
 from app.services.bot_jobs.constants import JobSource
 from app.services.bot_jobs.post_response import POST_RESPONSE_EVENT
+from app.services.bot_jobs.slack_ingress import slack_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +38,17 @@ async def _dispatch_slack_job(job: BotJob) -> None:
         files = event.get("files") or []
         channel_id = event.get("channel") or job.channel_id
         user_id = event.get("user") or job.user_id
-        thread_ts = event.get("thread_ts") or event.get("ts") or job.thread_ts
         channel_type = event.get("channel_type", "")
+        message_ts = event.get("ts")
+        session_key = slack_session_key(channel_id, user_id)
         await main_module.process_and_respond(
             channel_id,
             user_id,
             text,
-            thread_ts,
+            session_key,
             channel_type=channel_type,
             files=files,
+            message_ts=message_ts,
         )
         return
 
@@ -60,12 +63,14 @@ async def _dispatch_slack_job(job: BotJob) -> None:
         channel_id = payload.get("channel_id") or job.channel_id
         user_id = payload.get("user_id") or job.user_id
         text = (payload.get("text") or "").strip()
-        thread_ts = payload.get("thread_ts") or payload.get("ts") or job.thread_ts
+        message_ts = payload.get("ts")
+        session_key = slack_session_key(channel_id, user_id)
         await main_module.process_and_respond(
             channel_id,
             user_id,
             text,
-            thread_ts,
+            session_key,
+            message_ts=message_ts,
         )
         return
 

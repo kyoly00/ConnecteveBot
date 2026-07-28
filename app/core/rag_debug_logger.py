@@ -115,6 +115,16 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
+def _path_safe_session_id(session_id: str) -> str:
+    """Windows 등에서 경로로 쓸 수 있게 세션 ID를 정규화한다."""
+    s = (session_id or "").strip()
+    if not s:
+        return ""
+    for ch in ':\\/*?"<>|':
+        s = s.replace(ch, "_")
+    return s
+
+
 def set_session_id(session_id: str) -> None:
     """현재 실행 흐름의 세션(요청) ID를 설정합니다."""
     _session_id_var.set(session_id)
@@ -249,7 +259,7 @@ def cleanup_session(session_id: str | None = None) -> None:
     if not _ENABLED:
         return
 
-    sid = (session_id or _session_id_var.get() or "").strip()
+    sid = _path_safe_session_id(session_id or _session_id_var.get() or "")
     if not sid:
         return
 
@@ -262,7 +272,7 @@ def cleanup_session(session_id: str | None = None) -> None:
 
 def _get_handle(filename: str):
     """파일 핸들을 lazy open하여 캐시합니다."""
-    session_id = _session_id_var.get()
+    session_id = _path_safe_session_id(_session_id_var.get())
     
     if session_id:
         target_dir = _DEBUG_DIR / session_id

@@ -68,6 +68,7 @@ from app.core.config import (
     get_rag_planner_final_instructions,
     get_rag_evidence_planner_text_format,
     get_router_room_final_instruction,
+    get_router_personal_final_instruction,
     get_router_expense_final_instruction,
     RAG_MAX_PAGES,
     RAG_MAX_PARENTS,
@@ -88,6 +89,10 @@ from app.services.flex_hr.flex_hr import (
     build_flex_schedule_router_block,
     normalize_flex_schedule_tool_args,
     search_workers_schedule,
+)
+from app.services.outlook_room.managed_room_events import (
+    SYNC_WINDOW_DAYS,
+    format_query_window_label,
 )
 from app.services.outlook_room.schedule_reserve import (
     book_room,
@@ -113,6 +118,16 @@ from app.services.outlook_room.schedule_reserve import (
 )
 from app.services.outlook_room.schedule_reserve import (
     default_end_time_one_hour as room_default_end_time,
+)
+from app.services.outlook_room.personal_schedule import (
+    cancel_personal_event,
+    create_personal_event,
+    is_personal_write_action,
+    list_personal_schedule,
+    modify_personal_event,
+    normalize_personal_tool_args,
+    personal_write_once_message,
+    _NO_EMAIL_MSG as _PERSONAL_NO_EMAIL_MSG,
 )
 from app.services.tool_policy import (
     missing_fields_message,
@@ -228,6 +243,10 @@ _SEARCH_WORKER_SCHEDULE_TOOL: dict[str, Any] = {
         "description": (
             "Flex 근무·재택·휴가·외근·출장 조회. "
             "회의·미팅·Outlook 회의실 일정 조회에는 사용하지 않음 → manage_room_schedule list. "
+            "전체 현황('오늘 근태 현황'·'휴가자'·'재택인'·'전체 근무'): all_workers=true "
+            "(이름 없이 type별 명단). "
+            "특정일 재택·휴가·외근 브리핑('내일 휴가자'·'7월 15일 재택인'): "
+            "all_workers=true + date=YYYY-MM-DD (월간 JSON 기준 브리핑 포맷). "
             "개인: worker_name(전체 또는 성 제외 이름). "
             "질문에 여러 이름이 있으면 코드가 모두 조회. "
             "팀: team(예: Operation, RA, SW) 또는 질문의 '운영팀' 등 — roster 기준 해당 팀 전원 조회. "
@@ -243,7 +262,18 @@ _SEARCH_WORKER_SCHEDULE_TOOL: dict[str, Any] = {
             "properties": {
                 "worker_name": {
                     "type": "string",
-                    "description": "조회할 직원 이름. 팀·직무 조회 시 빈 문자열 가능.",
+                    "description": (
+                        "조회할 직원 이름. 팀·직무·전체 현황 조회 시 빈 문자열 가능. "
+                        "'전체'/'전원'이면 all_workers로 처리."
+                    ),
+                },
+                "all_workers": {
+                    "type": "boolean",
+                    "description": (
+                        "true면 전 직원 근태 명단. date 없으면 당일 type별 현황, "
+                        "date=YYYY-MM-DD면 해당일 재택·휴가·외근·출장 브리핑 "
+                        "(오늘=일간 JSON, 그 외=월간 JSON)."
+                    ),
                 },
                 "team": {
                     "type": "string",
@@ -293,8 +323,10 @@ _MANAGE_ROOM_SCHEDULE_TOOL: dict[str, Any] = {
         "name": "manage_room_schedule",
         "description": (
             "Outlook 회의·회의실 예약·조회·취소·변경. "
-            "list: 회의 일정 조회(person_name 생략=본인, 타인은 person_name). "
-            "하루=date만, 기간=date+end_date 또는 생략(7일). "
+            f"가용·예약(check/check_all/book): 오늘~{SYNC_WINDOW_DAYS}일 이내({format_query_window_label()})만. "
+            "list: 본인·타인 **회의실에 잡힌** 일정만(과거 최대 10일·미래 7일, DB). "
+            "본인 Outlook 전체 일정·일반 미팅 생성/변경/취소는 manage_personal_schedule. "
+            "list: person_name 생략=본인. 하루=date만, 기간=date+end_date 또는 생략(7일). "
             "'OO님 회의'·'이번 주 소연님 미팅' → list(person_name, date, end_date). "
             "과거·참석자·누구랑 → list(date=해당일), check 금지. "
             "room_name·start_time·end_time이 모두 있으면 book 즉시 (제목 생략 시 '회의'). "
@@ -330,11 +362,16 @@ _MANAGE_ROOM_SCHEDULE_TOOL: dict[str, Any] = {
                 },
                 "date": {
                     "type": "string",
-                    "description": "list·check용. 하루=date만, 기간=list는 date+end_date 또는 생략.",
+                    "description": (
+                        f"list·check용. check/check_all은 오늘~{SYNC_WINDOW_DAYS}일 이내만. "
+                        "list는 과거 10일·미래 7일. 하루=date만, 기간=list는 date+end_date."
+                    ),
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "list 기간 종료일(ISO). 하루·check·book은 생략.",
+                    "description": (
+                        f"list 기간 종료일(ISO). 미래는 {format_query_window_label()}까지만."
+                    ),
                 },
                 "person_name": {
                     "type": "string",
@@ -409,6 +446,88 @@ _MANAGE_ROOM_SCHEDULE_TOOL: dict[str, Any] = {
                 "reminder_minutes": {
                     "type": "integer",
                     "description": "set_reminder 필수. 회의 시작 N분 전 Slack 알림 (예: 15).",
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_MANAGE_PERSONAL_SCHEDULE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "manage_personal_schedule",
+        "description": (
+            "요청자 본인 Outlook 캘린더 전체 일정 조회·생성·변경·취소. "
+            "DB 동기화 없음 — Graph API 직접. "
+            "'내 일정'·'내일 내 미팅'·'3시에 미팅 잡아줘'(회의실 없이) → 이 도구. "
+            "회의실(Spine/Femur/Atlas/코넥홀) 예약·가용·타인 회의실 일정은 manage_room_schedule. "
+            "list: 하루=date, 기간=date+end_date|생략(오늘부터 7일). "
+            "create: subject·start_time 필수(end 없으면 +1h, subject 생략 시 '회의'). "
+            "modify/cancel: event_id 또는 subject+date/start_time 힌트."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "modify", "cancel"],
+                    "description": (
+                        "list=본인 Outlook 전체 일정, create=일정 생성, "
+                        "modify=변경, cancel=취소"
+                    ),
+                },
+                "date": {
+                    "type": "string",
+                    "description": "list·modify/cancel 힌트. YYYY-MM-DD.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "list 기간 종료일(YYYY-MM-DD).",
+                },
+                "event_id": {
+                    "type": "string",
+                    "description": "modify/cancel 선택. list 결과의 event_id.",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "create 제목(생략 시 '회의'). modify/cancel 대상 제목 힌트.",
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "create 시작 또는 modify/cancel 대상 시작 (ISO).",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "create 종료 (생략 시 시작+1h).",
+                },
+                "new_subject": {
+                    "type": "string",
+                    "description": "modify 신규 제목.",
+                },
+                "new_start_time": {
+                    "type": "string",
+                    "description": "modify 신규 시작.",
+                },
+                "new_end_time": {
+                    "type": "string",
+                    "description": "modify 신규 종료.",
+                },
+                "location": {
+                    "type": "string",
+                    "description": "create 장소(선택).",
+                },
+                "attendees": {
+                    "type": "array",
+                    "description": "create/modify 참석자 email 또는 {email,name}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "email": {"type": "string"},
+                            "name": {"type": "string"},
+                        },
+                    },
                 },
             },
             "required": ["action"],
@@ -524,6 +643,7 @@ def get_agent_tools() -> list[dict[str, Any]]:
         _QUERY_GOV_PROJECTS_TOOL,
         _SEARCH_WORKER_SCHEDULE_TOOL,
         _MANAGE_ROOM_SCHEDULE_TOOL,
+        _MANAGE_PERSONAL_SCHEDULE_TOOL,
         _ARCHIVE_EXPENSE_ATTACHMENT_TOOL,
         _RESPOND_GENERAL_TOOL,
     ]
@@ -1178,6 +1298,45 @@ def build_room_answer_messages(
     ]
 
 
+def build_personal_answer_messages(
+    *,
+    query_stripped: str,
+    personal_context: str,
+    has_context: bool,
+    memory_context: str = "",
+    conversation_context: str = "",
+    attachment_policy: AttachmentPolicy | None = None,
+    attachment_context: AttachmentContext | None = None,
+) -> list[dict[str, Any]]:
+    """본인 Outlook 일정 tool 결과 기반 Turn2 messages."""
+    suffix_blocks: list[str] = []
+    if has_context:
+        suffix_blocks.append(
+            f"<personal_schedule_results>\n{personal_context}\n</personal_schedule_results>"
+        )
+
+    turn2 = build_turn2_user_message_content(
+        query_stripped,
+        memory_context=memory_context,
+        prefix_blocks=[conversation_context] if conversation_context else None,
+        suffix_blocks=suffix_blocks or None,
+        attachment_policy=attachment_policy,
+        attachment_context=attachment_context,
+    )
+
+    return [
+        {
+            "role": "system",
+            "content": get_router_personal_final_instruction(
+                has_context=has_context,
+                memory_context=memory_context,
+                query=query_stripped,
+            ),
+        },
+        _answer_user_message(turn2),
+    ]
+
+
 _SOURCES_USED_PATTERN = re.compile(
     r"<sources_used>\s*(.*?)\s*</sources_used>",
     re.IGNORECASE | re.DOTALL,
@@ -1816,6 +1975,7 @@ async def execute_search_worker_schedule(
     )
     worker_names = list(tool_args.get("worker_names") or [])
     worker_name = str(tool_args.get("worker_name") or "").strip()
+    all_workers = bool(tool_args.get("all_workers"))
     team = str(tool_args.get("team") or "").strip()
     role_title = str(tool_args.get("role_title") or "").strip()
     date = str(tool_args.get("date") or "").strip() or None
@@ -1824,8 +1984,9 @@ async def execute_search_worker_schedule(
 
     logger.info(
         "[Agent] 도구 실행. name=search_worker_schedule, worker_names=%r, "
-        "team=%r, role_title=%r, date=%r, end_date=%r, year_month=%r",
+        "all_workers=%s, team=%r, role_title=%r, date=%r, end_date=%r, year_month=%r",
         worker_names,
+        all_workers,
         team,
         role_title,
         date,
@@ -1838,12 +1999,14 @@ async def execute_search_worker_schedule(
         date=date,
         end_date=end_date,
         year_month=year_month,
+        all_workers=all_workers,
     )
     tool_result = {
         "tool_name": "search_worker_schedule",
         "tool_call_id": tool_call.id,
         "worker_name": worker_name,
         "worker_names": worker_names,
+        "all_workers": all_workers,
         "team": team,
         "role_title": role_title,
         "matched_teams": tool_args.get("matched_teams") or [],
@@ -2198,6 +2361,113 @@ async def execute_manage_room_schedule(
     return sanitize_user_facing_tool_message(content), tool_result
 
 
+async def execute_manage_personal_schedule(
+    *,
+    tool_call,
+    query_stripped: str = "",
+    requester_email: str | None = None,
+    requester_name: str | None = None,
+    requester_slack_user_id: str | None = None,
+    personal_write_allowed: bool = True,
+) -> tuple[str, dict[str, Any]]:
+    """manage_personal_schedule — 본인 Outlook (DB 없음)."""
+    from app.services.outlook_room.attendee_resolver import resolve_organizer_email
+
+    tool_args = normalize_personal_tool_args(
+        parse_tool_arguments(tool_call.function.arguments),
+        query_stripped,
+    )
+    action = str(tool_args.get("action") or "list").strip()
+
+    if is_personal_write_action(action) and not personal_write_allowed:
+        tool_result = {
+            "tool_name": "manage_personal_schedule",
+            "tool_call_id": tool_call.id,
+            "action": action,
+            "skipped": "personal_write_once",
+        }
+        return sanitize_user_facing_tool_message(personal_write_once_message()), tool_result
+
+    organizer_email, _ = await resolve_organizer_email(
+        slack_user_id=requester_slack_user_id,
+        fallback_email=requester_email,
+        fallback_name=requester_name,
+    )
+    if not (organizer_email and "@" in (organizer_email or "")):
+        tool_result = {
+            "tool_name": "manage_personal_schedule",
+            "tool_call_id": tool_call.id,
+            "action": action,
+            "error": "no_organizer_email",
+        }
+        return sanitize_user_facing_tool_message(_PERSONAL_NO_EMAIL_MSG), tool_result
+
+    date_str = str(tool_args.get("date") or "").strip() or None
+    end_date_str = str(tool_args.get("end_date") or "").strip() or None
+    event_id = str(tool_args.get("event_id") or "").strip() or None
+    subject = str(tool_args.get("subject") or "").strip() or None
+    start_time = str(tool_args.get("start_time") or "").strip() or None
+    end_time = str(tool_args.get("end_time") or "").strip() or None
+    new_subject = str(tool_args.get("new_subject") or "").strip() or None
+    new_start_time = str(tool_args.get("new_start_time") or "").strip() or None
+    new_end_time = str(tool_args.get("new_end_time") or "").strip() or None
+    location = str(tool_args.get("location") or "").strip() or None
+    attendees = tool_args.get("attendees")
+
+    logger.info(
+        "[Agent] 도구 실행. name=manage_personal_schedule, action=%r",
+        action,
+    )
+
+    if action == "list":
+        content = await list_personal_schedule(
+            organizer_email=organizer_email,
+            date_str=date_str,
+            end_date_str=end_date_str,
+        )
+    elif action == "create":
+        if not start_time:
+            content = "일정을 만들려면 시작 시각을 알려 주세요."
+        else:
+            content = await create_personal_event(
+                organizer_email=organizer_email,
+                subject=subject or "회의",
+                start_time=start_time,
+                end_time=end_time or room_default_end_time(start_time),
+                attendees=attendees if isinstance(attendees, list) else None,
+                location=location,
+            )
+    elif action == "modify":
+        content = await modify_personal_event(
+            organizer_email=organizer_email,
+            event_id=event_id,
+            subject=subject,
+            date_str=date_str,
+            start_time=start_time,
+            new_subject=new_subject,
+            new_start_time=new_start_time,
+            new_end_time=new_end_time,
+            attendees=attendees if isinstance(attendees, list) else None,
+        )
+    elif action == "cancel":
+        content = await cancel_personal_event(
+            organizer_email=organizer_email,
+            event_id=event_id,
+            subject=subject,
+            date_str=date_str,
+            start_time=start_time,
+        )
+    else:
+        content = "지원하지 않는 작업입니다. list·create·modify·cancel 중 하나를 사용하세요."
+
+    tool_result = {
+        "tool_name": "manage_personal_schedule",
+        "tool_call_id": tool_call.id,
+        "action": action,
+    }
+    return sanitize_user_facing_tool_message(content), tool_result
+
+
 async def execute_archive_expense_attachment(
     *,
     tool_call: Any,
@@ -2243,13 +2513,14 @@ async def execute_tool_calls(
     requester_slack_user_id: str | None = None,
     requester_slack_channel_id: str | None = None,
     attachment_bundle: UserAttachmentBundle | None = None,
-) -> tuple[list, list[dict[str, Any]], list[dict[str, Any]], str, str, str, str]:
+) -> tuple[list, list[dict[str, Any]], list[dict[str, Any]], str, str, str, str, str]:
     """
     assistant가 요청한 tool_calls 실행.
 
     Returns:
         unique_docs, tool_results, gov_attachments, gov_context_text,
-        flex_context_text, room_context_text, expense_context_text
+        flex_context_text, room_context_text, expense_context_text,
+        personal_context_text
     """
 
     all_docs = []
@@ -2259,9 +2530,11 @@ async def execute_tool_calls(
     flex_context_parts: list[str] = []
     room_context_parts: list[str] = []
     expense_context_parts: list[str] = []
+    personal_context_parts: list[str] = []
+    personal_write_executed = False
 
     if not tool_calls:
-        return all_docs, tool_results, gov_attachments, "", "", "", ""
+        return all_docs, tool_results, gov_attachments, "", "", "", "", ""
 
     messages.append(
         {
@@ -2356,6 +2629,32 @@ async def execute_tool_calls(
                 room_context_parts.append(tool_content)
                 tool_results.append(tool_result)
 
+            elif tool_name == "manage_personal_schedule":
+                peek_args = normalize_personal_tool_args(
+                    parse_tool_arguments(tool_call.function.arguments),
+                    query_stripped,
+                )
+                peek_action = str(peek_args.get("action") or "list").strip()
+                allow_personal_write = True
+                if is_personal_write_action(peek_action):
+                    if personal_write_executed:
+                        allow_personal_write = False
+                    else:
+                        personal_write_executed = True
+
+                tool_content, tool_result = await execute_manage_personal_schedule(
+                    tool_call=tool_call,
+                    query_stripped=query_stripped,
+                    requester_email=requester_email,
+                    requester_name=requester_name,
+                    requester_slack_user_id=requester_slack_user_id,
+                    personal_write_allowed=allow_personal_write,
+                )
+                if allow_personal_write or not is_personal_write_action(peek_action):
+                    executed_count += 1
+                personal_context_parts.append(tool_content)
+                tool_results.append(tool_result)
+
             elif tool_name == "archive_expense_attachment":
                 tool_content, tool_result = await execute_archive_expense_attachment(
                     tool_call=tool_call,
@@ -2423,6 +2722,7 @@ async def execute_tool_calls(
     flex_context_text = "\n\n---\n\n".join(p for p in flex_context_parts if p.strip())
     room_context_text = "\n\n---\n\n".join(p for p in room_context_parts if p.strip())
     expense_context_text = "\n\n---\n\n".join(p for p in expense_context_parts if p.strip())
+    personal_context_text = "\n\n---\n\n".join(p for p in personal_context_parts if p.strip())
     return (
         unique_docs,
         tool_results,
@@ -2431,6 +2731,7 @@ async def execute_tool_calls(
         flex_context_text,
         room_context_text,
         expense_context_text,
+        personal_context_text,
     )
 
 
@@ -2618,11 +2919,14 @@ async def async_agent_chat(
         wiki_tool_used = "search_company_wiki" in tool_names
         flex_tool_used = "search_worker_schedule" in tool_names
         room_tool_used = "manage_room_schedule" in tool_names
+        personal_tool_used = "manage_personal_schedule" in tool_names
         expense_tool_used = "archive_expense_attachment" in tool_names
         general_tool_used = "respond_general" in tool_names
-        if room_tool_used:
+        if personal_tool_used and not room_tool_used:
+            route_label = "personal"
+        elif room_tool_used:
             route_label = "room"
-        elif expense_tool_used and not wiki_tool_used and not gov_tool_used and not flex_tool_used and not room_tool_used:
+        elif expense_tool_used and not wiki_tool_used and not gov_tool_used and not flex_tool_used and not room_tool_used and not personal_tool_used:
             route_label = "expense"
         elif general_tool_used and not wiki_tool_used and not gov_tool_used and not flex_tool_used:
             route_label = "general"
@@ -2669,6 +2973,8 @@ async def async_agent_chat(
                 status = "_근무 일정을 조회하고 있습니다…_"
             elif route_label == "room":
                 status = "_회의실 일정을 처리하고 있습니다…_"
+            elif route_label == "personal":
+                status = "_Outlook 일정을 처리하고 있습니다…_"
             elif route_label == "expense":
                 status = "_경비 증빙을 OneDrive에 정리하고 있습니다…_"
             elif route_label == "general":
@@ -2687,6 +2993,7 @@ async def async_agent_chat(
             flex_context_text,
             room_context_text,
             expense_context_text,
+            personal_context_text,
         ) = await execute_tool_calls(
             messages=messages,
             tool_calls=business_tool_calls,
@@ -2732,6 +3039,7 @@ async def async_agent_chat(
         # 4. 최종 답변 — 정부과제 / Flex 근태 / 회의실 예약 / 사내 RAG
         has_flex_context = bool(flex_context_text.strip())
         has_room_context = bool(room_context_text.strip())
+        has_personal_context = bool(personal_context_text.strip())
         has_expense_context = bool(expense_context_text.strip())
         rag_researched = False
         rag_three_phase = False
@@ -2767,6 +3075,16 @@ async def async_agent_chat(
                 query_stripped=query_stripped,
                 room_context=room_context_text,
                 has_context=has_room_context,
+                memory_context=memory_context,
+                conversation_context=conversation_context,
+                attachment_policy=turn2_attachment_policy,
+                attachment_context=attachment_context,
+            )
+        elif route_label == "personal":
+            answer_messages = build_personal_answer_messages(
+                query_stripped=query_stripped,
+                personal_context=personal_context_text,
+                has_context=has_personal_context,
                 memory_context=memory_context,
                 conversation_context=conversation_context,
                 attachment_policy=turn2_attachment_policy,
@@ -2980,6 +3298,11 @@ async def async_agent_chat(
         elif route_label == "room":
             final_answer = raw_turn2.strip() or "답변을 생성하지 못했습니다."
             intent = "room_schedule" if has_room_context else "room_schedule_no_data"
+        elif route_label == "personal":
+            final_answer = raw_turn2.strip() or "답변을 생성하지 못했습니다."
+            intent = (
+                "personal_schedule" if has_personal_context else "personal_schedule_no_data"
+            )
         elif route_label == "expense":
             final_answer = raw_turn2.strip() or "답변을 생성하지 못했습니다."
             intent = "expense_archive" if has_expense_context else "expense_archive_no_data"

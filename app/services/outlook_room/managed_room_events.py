@@ -7,6 +7,7 @@ managed_room_events — 회의실 Outlook 캘린더 로컬 projection (read mode
 from __future__ import annotations
 
 import logging
+import os
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -23,9 +24,10 @@ logger = logging.getLogger(__name__)
 _ACTIVE = "active"
 _CANCELLED = "cancelled"
 
-RETENTION_PAST_DAYS = 7
-RETENTION_FUTURE_DAYS = 30
-DEFAULT_LIST_RANGE_DAYS = 7
+SYNC_WINDOW_DAYS = int(os.getenv("MANAGED_ROOM_SYNC_WINDOW_DAYS", "7"))
+DB_RETENTION_PAST_DAYS = int(os.getenv("MANAGED_ROOM_DB_RETENTION_PAST_DAYS", "10"))
+
+DEFAULT_LIST_RANGE_DAYS = SYNC_WINDOW_DAYS
 
 _PLACEHOLDER_BOOKING_ID_MARKERS = (
     "auto_detect",
@@ -38,14 +40,77 @@ _PLACEHOLDER_BOOKING_ID_MARKERS = (
 _SUBJECT_TAG_RE = re.compile(r"^\[[A-Z]+\]\s*")
 
 
+def sync_window(reference: date | None = None) -> tuple[date, date]:
+    """Graph API 동기화 구간: 오늘 ~ 오늘+7일 (end exclusive)."""
+    today = reference or date.today()
+    return today, today + timedelta(days=SYNC_WINDOW_DAYS)
+
+
 def retention_window(
     reference: date | None = None,
 ) -> tuple[date, date]:
-    """저장·동기화 윈도우: 오늘 -7일 ~ +30일 (end exclusive = +31일 00:00 기준)."""
+    """DB 보관 구간: 10일 전 ~ 오늘+7일 (end exclusive). 만료 행은 purge."""
     today = reference or date.today()
-    start = today - timedelta(days=RETENTION_PAST_DAYS)
-    end_exclusive = today + timedelta(days=RETENTION_FUTURE_DAYS + 1)
+    start = today - timedelta(days=DB_RETENTION_PAST_DAYS)
+    end_exclusive = today + timedelta(days=SYNC_WINDOW_DAYS)
     return start, end_exclusive
+
+
+def query_window_start(reference: date | None = None) -> date:
+    """가용·예약 조회 가능 시작일 (오늘)."""
+    return reference or date.today()
+
+
+def query_window_end_inclusive(reference: date | None = None) -> date:
+    """가용·예약 조회 가능 마지막 날 (오늘+6, 7일치)."""
+    today = reference or date.today()
+    return today + timedelta(days=SYNC_WINDOW_DAYS - 1)
+
+
+def format_query_window_label(reference: date | None = None) -> str:
+    return (
+        f"{query_window_start(reference).isoformat()}"
+        f"~{query_window_end_inclusive(reference).isoformat()}"
+    )
+
+
+def is_date_in_query_window(target: date, reference: date | None = None) -> bool:
+    return query_window_start(reference) <= target <= query_window_end_inclusive(reference)
+
+
+def validate_availability_query_date(target: date, reference: date | None = None) -> str | None:
+    """check/check_all/book 날짜 검증. 범위 밖이면 안내 메시지."""
+    if is_date_in_query_window(target, reference):
+        return None
+    return (
+        f"회의실 가용·예약 조회는 오늘부터 {SYNC_WINDOW_DAYS}일 이내"
+        f"({format_query_window_label(reference)})만 가능합니다. "
+        f"요청일 {target.isoformat()}은 범위 밖입니다."
+    )
+
+
+def validate_list_query_range(
+    start: date,
+    end_exclusive: date,
+    reference: date | None = None,
+) -> str | None:
+    """list 조회 범위 검증 — DB 보관(과거 10일)·조회(미래 7일) 한도."""
+    end_day = end_exclusive - timedelta(days=1)
+    earliest = query_window_start(reference) - timedelta(days=DB_RETENTION_PAST_DAYS)
+    latest = query_window_end_inclusive(reference)
+    if end_day < earliest:
+        return (
+            f"과거 회의 일정 조회는 최대 {DB_RETENTION_PAST_DAYS}일 전"
+            f"({earliest.isoformat()})부터 가능합니다."
+        )
+    if start > latest:
+        return validate_availability_query_date(start, reference)
+    if end_day > latest:
+        return (
+            f"미래 조회는 {format_query_window_label(reference)}까지만 가능합니다. "
+            f"요청 종료일 {end_day.isoformat()}은 범위 밖입니다."
+        )
+    return None
 
 
 def is_valid_booking_uuid(value: str | None) -> bool:

@@ -48,7 +48,48 @@ REMOTE_TYPE = "재택근무"
 VACATION_TYPE = "휴가"
 OUTING_TYPE = "외근"
 OVERSEAS_TYPE = "출장"
+WORK_TYPE = "근무"
+NO_SCHEDULE_TYPE = "일정 없음"
 DEFAULT_AFTERNOON_LEAVE_END = "오후 6:00"
+
+# 전체 근태 type 명단 표시 순서
+_ATTENDANCE_TYPE_ORDER: tuple[str, ...] = (
+    WORK_TYPE,
+    REMOTE_TYPE,
+    VACATION_TYPE,
+    OUTING_TYPE,
+    OVERSEAS_TYPE,
+    "기타",
+    NO_SCHEDULE_TYPE,
+)
+
+_ALL_WORKERS_QUERY_MARKERS: tuple[str, ...] = (
+    "전체 근태",
+    "전체근태",
+    "전체 근무",
+    "전체근무",
+    "전원 근태",
+    "전원 근무",
+    "전직원",
+    "근태 현황",
+    "근무 현황",
+    "전체 현황",
+    "전체 휴가",
+    "전체 재택",
+    "휴가자",
+    "재택인",
+    "재택자",
+    "재택 근무자",
+    "재택근무자",
+    "외근자",
+    "외근인",
+    "출장자",
+    "출장인",
+)
+
+_ALL_WORKERS_NAME_ALIASES: frozenset[str] = frozenset(
+    {"전체", "전원", "모두", "전직원", "everybody", "everyone", "all"}
+)
 
 # 질문 키워드 → roster employees[].team 값
 TEAM_QUERY_ALIASES: dict[str, tuple[str, ...]] = {
@@ -74,9 +115,13 @@ ROLE_QUERY_ALIASES: dict[str, tuple[str, ...]] = {
 
 # --- Playwright 프로필 단일 사용 (일간 우선) ---
 
-FlexPlaywrightJobKind = Literal["daily", "monthly"]
+FlexPlaywrightJobKind = Literal["daily", "monthly", "session_refresh"]
 
-_PLAYWRIGHT_PRIORITY: dict[FlexPlaywrightJobKind, int] = {"daily": 0, "monthly": 1}
+_PLAYWRIGHT_PRIORITY: dict[FlexPlaywrightJobKind, int] = {
+    "daily": 0,
+    "monthly": 1,
+    "session_refresh": 2,
+}
 _playwright_ticket_counter = itertools.count()
 _playwright_mutex = threading.Lock()
 _playwright_cond = threading.Condition(_playwright_mutex)
@@ -131,6 +176,60 @@ def flex_playwright_session(kind: FlexPlaywrightJobKind):
             _playwright_running = None
             print(f"[Flex Playwright] {kind} 세션 종료")
             _playwright_cond.notify_all()
+
+
+_FLEX_SESSION_REFRESH_MARKER = FLEX_HR_DIR / ".flex_session_refreshed_at"
+
+
+def _write_flex_session_refresh_marker(payload: dict[str, Any]) -> Path:
+    FLEX_HR_DIR.mkdir(parents=True, exist_ok=True)
+    _FLEX_SESSION_REFRESH_MARKER.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return _FLEX_SESSION_REFRESH_MARKER
+
+
+def read_flex_session_refresh_marker() -> dict[str, Any] | None:
+    if not _FLEX_SESSION_REFRESH_MARKER.is_file():
+        return None
+    try:
+        return json.loads(_FLEX_SESSION_REFRESH_MARKER.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def flex_session_refresh_stale(*, max_age_days: int | None = None) -> bool:
+    """마지막 세션 갱신이 max_age_days보다 오래됐거나 없으면 True."""
+    days = max_age_days
+    if days is None:
+        days = int(os.getenv("FLEX_SESSION_REFRESH_MAX_AGE_DAYS", "7") or "7")
+    marker = read_flex_session_refresh_marker()
+    if not marker:
+        return True
+    raw = str(marker.get("refreshed_at") or "").strip()
+    if not raw:
+        return True
+    cleaned = raw.replace("KST", "").strip()
+    for candidate in (cleaned[:19], cleaned[:10]):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(candidate, fmt)
+                return (datetime.now() - dt) > timedelta(days=days)
+            except ValueError:
+                continue
+    return True
+
+
+def run_flex_session_refresh() -> dict[str, Any]:
+    """주간 Flex Playwright 세션 갱신 (프로필 쿠키 연장)."""
+    from app.services.flex_hr.flex_parser import refresh_flex_playwright_session
+
+    with flex_playwright_session("session_refresh"):
+        result = refresh_flex_playwright_session()
+    if result.get("ok"):
+        _write_flex_session_refresh_marker(result)
+    return result
 
 
 def _planned_statuses(member: dict[str, Any]) -> list[dict[str, Any]]:
@@ -722,14 +821,183 @@ def _members_vacation_roster(members: list[dict[str, Any]]) -> list[str]:
     return _members_leave_roster(members, VACATION_TYPE)
 
 
+def _member_attendance_types(member: dict[str, Any]) -> list[str]:
+    """schedule_status의 type만 고유 순서로 추출 (시각·record_kind 제외)."""
+    types: list[str] = []
+    for status in member.get("schedule_status") or []:
+        item_type = str(status.get("type") or "").strip()
+        if item_type and item_type not in types:
+            types.append(item_type)
+    return types
+
+
+def _attendance_type_sort_key(schedule_type: str) -> tuple[int, str]:
+    try:
+        return (_ATTENDANCE_TYPE_ORDER.index(schedule_type), schedule_type)
+    except ValueError:
+        return (len(_ATTENDANCE_TYPE_ORDER), schedule_type)
+
+
+def query_wants_all_workers_attendance(query: str) -> bool:
+    """전체·현황·휴가자 등 회사 단위 근태 질문인지."""
+    q = (query or "").strip().lower().replace(" ", "")
+    if not q:
+        return False
+    compact_markers = tuple(m.lower().replace(" ", "") for m in _ALL_WORKERS_QUERY_MARKERS)
+    return any(marker in q for marker in compact_markers)
+
+
+def build_all_workers_type_roster_text(data: dict[str, Any] | None = None) -> str:
+    """
+    당일 Flex JSON에서 type만 모아 전체 직원 근태 현황 텍스트를 만든다.
+    (이름 → type 그룹. 시작/종료 시각·누적시간 제외)
+    """
+    payload = data or load_latest_flex_hr()
+    if not payload:
+        return "Flex 근태 데이터가 아직 수집되지 않았습니다."
+
+    members = list(payload.get("members") or [])
+    by_type: dict[str, list[str]] = {}
+    for member in members:
+        name = _member_name(member)
+        if not name:
+            continue
+        types = _member_attendance_types(member)
+        if not types:
+            by_type.setdefault(NO_SCHEDULE_TYPE, []).append(name)
+            continue
+        for item_type in types:
+            by_type.setdefault(item_type, []).append(name)
+
+    data_date = str(payload.get("date") or "").strip() or "(미표기)"
+    header = (
+        f"데이터 기준일: {data_date} | "
+        f"수집 시각(갱신): {payload.get('updated_at') or '(미표기)'} | "
+        f"※ 전체 근태 현황 — schedule_status.type만 사용 (시각·누적시간 없음)"
+    )
+    lines = [
+        header,
+        "",
+        "[전체 근태 현황]",
+        f"인원: {len(members)}명",
+    ]
+    for schedule_type in sorted(by_type.keys(), key=_attendance_type_sort_key):
+        names = sorted(by_type[schedule_type])
+        lines.append(f"{schedule_type} ({len(names)}): {', '.join(names)}")
+    return "\n".join(lines)
+
+
+def search_all_workers_attendance_types(
+    *,
+    data: dict[str, Any] | None = None,
+) -> str:
+    """search_worker_schedule(all_workers) — 당일 전체 type 명단."""
+    return build_all_workers_type_roster_text(data)
+
+
+_WEEKDAY_KO = ("월", "화", "수", "목", "금", "토", "일")
+
+
+def _date_label_ko(iso_date: str) -> str:
+    """YYYY-MM-DD → 'YYYY-MM-DD (월)'."""
+    try:
+        day = date.fromisoformat(iso_date[:10])
+    except ValueError:
+        return iso_date
+    return f"{day.isoformat()} ({_WEEKDAY_KO[day.weekday()]})"
+
+
+def _format_leave_briefing_lines(
+    *,
+    header: str,
+    members: list[dict[str, Any]],
+) -> str:
+    """재택·휴가·외근·출장 브리핑 본문 (일간·월간 공통)."""
+    remote = _members_with_type(members, REMOTE_TYPE)
+    vacation = _members_vacation_roster(members)
+    outing = _members_leave_roster(members, OUTING_TYPE)
+    overseas = _members_with_type(members, OVERSEAS_TYPE)
+
+    lines = [
+        header,
+        f":house: 재택 근무자: {', '.join(remote) if remote else '없음'}",
+        f":beach_with_umbrella: 휴가자: {', '.join(vacation) if vacation else '없음'}",
+        f":car: 외근자: {', '.join(outing) if outing else '없음'}",
+    ]
+    if overseas:
+        lines.append(
+            f":luggage: 출장자: {', '.join(overseas)}"
+        )
+    return "\n".join(lines)
+
+
+def _monthly_members_for_date(
+    monthly: dict[str, Any],
+    target_date: str,
+) -> list[dict[str, Any]]:
+    """월간 JSON → 특정일 일간 형식 members (schedule_status=items)."""
+    day = target_date[:10]
+    out: list[dict[str, Any]] = []
+    for member in monthly.get("members") or []:
+        items: list[dict[str, Any]] = []
+        for day_row in member.get("days") or []:
+            if str(day_row.get("date") or "")[:10] != day:
+                continue
+            items = list(day_row.get("items") or [])
+            break
+        out.append({
+            "user": member.get("user") or {},
+            "schedule_status": [
+                {
+                    "type": str(it.get("type") or "").strip(),
+                    "start_time": str(it.get("start_time") or "").strip(),
+                    "end_time": str(it.get("end_time") or "").strip(),
+                    "record_kind": "block",
+                }
+                for it in items
+                if str(it.get("type") or "").strip()
+            ],
+        })
+    return out
+
+
+def build_roster_text_for_date(
+    target_date: str,
+    *,
+    monthly: dict[str, Any] | None = None,
+) -> str:
+    """
+    월간 JSON에서 특정일의 재택·휴가·외근·출장 브리핑 텍스트를 만든다.
+    (일일 Slack 브리핑과 동일 포맷)
+    """
+    day = (target_date or "").strip()[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return "날짜는 YYYY-MM-DD 형식으로 지정해 주세요."
+
+    payload = monthly if monthly is not None else load_flex_hr_monthly(day[:7])
+    label = _date_label_ko(day)
+    if not payload:
+        return (
+            f"• {label} 근태 현황 알림\n"
+            f"⚠️ 해당 월({day[:7]}) Flex 월간 근태 데이터가 없습니다."
+        )
+
+    members = _monthly_members_for_date(payload, day)
+    updated = str(payload.get("updated_at") or "").strip()
+    header = f"• {label} 근태 현황 알림"
+    if updated:
+        header = f"{header}\n데이터 기준일: {day} | 월간 수집 시각(갱신): {updated}"
+    else:
+        header = f"{header}\n데이터 기준일: {day}"
+    return _format_leave_briefing_lines(header=header, members=members)
+
+
 def build_daily_roster_text(data: dict[str, Any] | None = None) -> str:
     """금일 재택·휴가자 명단 문자열 (슬랙 최적화 버전)."""
     payload = data or load_latest_flex_hr()
-    
-    # 요일까지 명시된 오늘 날짜 생성 (ex: 2026년 06월 15일 (월))
-    now = datetime.now(timezone('Asia/Seoul'))
-    weekday_map = {0: "월", 1: "화", 2: "수", 3: "목", 4: "금", 5: "토", 6: "일"}
-    today_date = now.strftime(f"%Y-%m-%d ({weekday_map[now.weekday()]})")
+
+    now = datetime.now(timezone("Asia/Seoul"))
+    today_date = now.strftime(f"%Y-%m-%d ({_WEEKDAY_KO[now.weekday()]})")
 
     if not payload:
         return (
@@ -738,25 +1006,10 @@ def build_daily_roster_text(data: dict[str, Any] | None = None) -> str:
         )
 
     members = list(payload.get("members") or [])
-    remote = _members_with_type(members, REMOTE_TYPE)
-    vacation = _members_vacation_roster(members)
-    outing = _members_leave_roster(members, OUTING_TYPE)
-    overseas = _members_with_type(members, OVERSEAS_TYPE)
-    
-    remote_text = ", ".join(remote) if remote else "없음"
-    vacation_text = ", ".join(vacation) if vacation else "없음"
-    outing_text = ", ".join(outing) if outing else "없음"
-    overseas_text = ", ".join(overseas) if overseas else "없음"
-    
-    lines = [
-        f"• 금일 근태 현황 알림 ({today_date})",
-        f":house: 재택 근무자: {remote_text}",
-        f":beach_with_umbrella: 휴가자: {vacation_text}",
-        f":car: 외근자: {outing_text}",
-    ]
-    if overseas:
-        lines.append(f":luggage: 출장자: {overseas_text}")
-    return "\n".join(lines)
+    return _format_leave_briefing_lines(
+        header=f"• 금일 근태 현황 알림 ({today_date})",
+        members=members,
+    )
 
 
 def build_flex_schedule_router_block(query: str) -> str:
@@ -839,8 +1092,9 @@ def _format_schedule_block(member: dict[str, Any], data: dict[str, Any]) -> str:
     if roster_team:
         lines.append(f"팀: {roster_team}")
     lines.extend([
-        f"날짜: {date}",
-        f"Flex 기준 현재 시각: {current_time or '(미표시)'}",
+        f"날짜(데이터 기준일): {date or '(미표기)'}",
+        f"Flex UI 표시 시각: {current_time or '(미표시)'} "
+        f"(이 시각은 수집 당시 Flex 화면 시각이며, 일정 날짜와 혼동하지 말 것)",
     ])
     if _is_meaningful_summary_time(summary_time):
         lines.append(f"누적 근무시간: {summary_time}")
@@ -1124,13 +1378,14 @@ def _search_worker_schedule_date_range(
         return f"'{worker_name}' 직원을 Flex 월간 데이터에서 찾지 못했습니다.{suffix}"
 
     header = (
-        f"조회 범위: {start_iso}~{end_iso} (월간 일별, "
+        f"데이터 기준 범위: {start_iso}~{end_iso} (월간 일별, "
         f"조회 월: {', '.join(months)})"
     )
     if updated_parts:
-        header += f" | 갱신: {'; '.join(updated_parts)}"
+        header += f" | 수집 시각(갱신): {'; '.join(updated_parts)}"
     if missing:
         header += f" | 미수집 월: {', '.join(missing)}"
+    header += " | ※ 일정 날짜는 각 일별 date 필드 기준"
 
     result = header + "\n\n" + "\n\n---\n\n".join(blocks)
 
@@ -1157,6 +1412,30 @@ def normalize_flex_schedule_tool_args(
     worker_name = str(normalized.get("worker_name") or "").strip()
     team = str(normalized.get("team") or "").strip()
     role_title = str(normalized.get("role_title") or "").strip()
+    all_workers = bool(normalized.get("all_workers"))
+
+    if worker_name in _ALL_WORKERS_NAME_ALIASES:
+        all_workers = True
+        worker_name = ""
+        normalized["worker_name"] = ""
+
+    if (
+        not all_workers
+        and not worker_name
+        and not team
+        and not role_title
+        and query_wants_all_workers_attendance(query)
+        and not match_employees_in_query(query)
+    ):
+        all_workers = True
+
+    normalized["all_workers"] = all_workers
+    if all_workers:
+        normalized["worker_names"] = []
+        normalized["matched_teams"] = []
+        normalized["matched_roles"] = []
+        return normalized
+
     normalized["worker_names"] = resolve_schedule_worker_names(
         query,
         worker_name,
@@ -1184,11 +1463,19 @@ def search_workers_schedule(
     date: str | None = None,
     end_date: str | None = None,
     year_month: str | None = None,
+    all_workers: bool = False,
 ) -> str:
     """여러 직원 근태를 한 번에 조회해 Turn2 프롬프트용 텍스트를 반환한다."""
+    if all_workers:
+        target = (date or "").strip()[:10] or None
+        if target and re.fullmatch(r"\d{4}-\d{2}-\d{2}", target):
+            if _is_today(target):
+                return build_daily_roster_text()
+            return build_roster_text_for_date(target)
+        return search_all_workers_attendance_types()
     unique = list(dict.fromkeys(n.strip() for n in worker_names if (n or "").strip()))
     if not unique:
-        return "조회할 직원 이름이 필요합니다."
+        return "조회할 직원 이름이 필요합니다. 전체 현황은 all_workers=true."
     if len(unique) == 1:
         return search_worker_schedule(
             unique[0],
@@ -1273,8 +1560,9 @@ def search_worker_schedule(
         ]
         scope = target_date or payload.get("year_month") or ""
         header = (
-            f"조회 범위: {scope} (월간 일별) | "
-            f"갱신: {payload.get('updated_at') or ''}"
+            f"데이터 기준 범위: {scope} (월간 일별) | "
+            f"수집 시각(갱신): {payload.get('updated_at') or '(미표기)'} | "
+            f"※ '수집 시각'은 일정 날짜가 아님. 일별 날짜 필드를 일정 기준으로 쓸 것"
         )
         result = header + "\n\n" + "\n\n---\n\n".join(blocks)
         if _should_overlay_daily_today(
@@ -1299,7 +1587,13 @@ def search_worker_schedule(
         return f"'{worker_name}' 직원을 Flex 근태 데이터에서 찾지 못했습니다.{suffix}"
 
     blocks = [_format_schedule_block(member, payload) for member in matches]
-    header = f"조회 기준일: {payload.get('date') or ''} | 갱신: {payload.get('updated_at') or ''}"
+    data_date = str(payload.get("date") or "").strip() or "(미표기)"
+    header = (
+        f"데이터 기준일: {data_date} | "
+        f"수집 시각(갱신): {payload.get('updated_at') or '(미표기)'} | "
+        f"※ 답변의 일정 날짜는 '데이터 기준일'을 사용. "
+        f"벽시계 오늘과 다르면 데이터 기준일로만 말할 것"
+    )
     return header + "\n\n" + "\n\n---\n\n".join(blocks)
 
 

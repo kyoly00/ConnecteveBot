@@ -7,6 +7,9 @@ import logging
 import os
 import socket
 
+from slack_sdk.errors import SlackApiError
+
+from app.services.bot_jobs.constants import PERMANENT_SLACK_ERRORS, PermanentJobError
 from app.services.bot_jobs.handlers import dispatch_bot_job
 from app.services.bot_jobs.queue import (
     claim_next_job,
@@ -28,6 +31,33 @@ def worker_count() -> int:
     return max(1, int(os.getenv("BOT_JOB_WORKER_COUNT", "4")))
 
 
+def _slack_error_code(exc: SlackApiError) -> str | None:
+    try:
+        data = exc.response.data if exc.response is not None else {}
+        if isinstance(data, dict):
+            return str(data.get("error") or "") or None
+    except Exception:
+        pass
+    return None
+
+
+def _is_permanent_error(exc: Exception) -> bool:
+    if isinstance(exc, PermanentJobError):
+        return True
+    if isinstance(exc, SlackApiError):
+        code = _slack_error_code(exc)
+        return bool(code and code in PERMANENT_SLACK_ERRORS)
+    return False
+
+
+def _error_code_for(exc: Exception) -> str:
+    if isinstance(exc, PermanentJobError):
+        return exc.error_code
+    if isinstance(exc, SlackApiError):
+        return _slack_error_code(exc) or type(exc).__name__
+    return type(exc).__name__
+
+
 async def _process_one_job(wid: str) -> bool:
     job = await claim_next_job(wid)
     if not job:
@@ -40,8 +70,9 @@ async def _process_one_job(wid: str) -> bool:
             job.id,
             attempt_count=job.attempt_count,
             max_attempts=job.max_attempts,
-            error_code=type(e).__name__,
+            error_code=_error_code_for(e),
             error_message=str(e),
+            retryable=not _is_permanent_error(e),
         )
     return True
 

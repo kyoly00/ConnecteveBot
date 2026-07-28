@@ -57,14 +57,14 @@ def sanitize_user_facing_tool_message(content: str) -> str:
         text,
     )
     text = re.sub(
-        r"manage_room_schedule|search_company_wiki|respond_general|"
+        r"manage_room_schedule|manage_personal_schedule|search_company_wiki|respond_general|"
         r"search_worker_schedule|query_gov_projects",
         "내부 처리",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"\b(list|list_mine|check_all|set_reminder|check|book|modify|cancel|replace)\b",
+        r"\b(list|list_mine|check_all|set_reminder|check|book|create|modify|cancel|replace)\b",
         lambda m: {
             "list": "회의 일정 조회",
             "list_mine": "회의 일정 조회",
@@ -72,6 +72,7 @@ def sanitize_user_facing_tool_message(content: str) -> str:
             "set_reminder": "리마인더 설정",
             "check": "회의실 조회",
             "book": "예약",
+            "create": "일정 생성",
             "modify": "예약 변경",
             "cancel": "예약 취소",
             "replace": "재예약",
