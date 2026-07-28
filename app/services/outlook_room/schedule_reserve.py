@@ -171,7 +171,7 @@ def enrich_book_tool_args(
     query: str,
     conversation_history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """book 인자 — LLM room_name·시각(종료 없으면 +1h) 보완."""
+    """book 인자 — LLM room_name·시각(종료 없으면 +1h) 보완. 맥락 시각은 Turn1 LLM이 채운다."""
     out = dict(args)
     room = resolve_booking_room(
         str(out.get("room_name") or "").strip() or None,
@@ -978,7 +978,7 @@ async def cancel_room(
     if not resolved_id:
         return (
             "취소할 예약을 찾지 못했습니다. "
-            "list_mine으로 booking_id를 확인하거나 회의실·날짜·시간을 알려주세요."
+            "회의실·날짜·시작 시각을 알려주시면 다시 찾아 보겠습니다."
         )
 
     organizer = (matched.organizer_email if matched else organizer_email or "").strip()
@@ -1058,7 +1058,10 @@ async def modify_room(
     if lookup_err:
         return lookup_err
     if not booking:
-        return "변경할 본인 예약을 찾지 못했습니다. list_mine으로 booking_id를 확인해 주세요."
+        return (
+            "변경할 본인 예약을 찾지 못했습니다. "
+            "회의실·날짜·시작 시각을 알려주시면 다시 찾아 보겠습니다."
+        )
 
     org_event_id = (booking.organizer_event_id or "").strip()
     if not org_event_id or org_event_id.startswith("pending:"):
@@ -1223,7 +1226,10 @@ async def set_room_reminder(
     if lookup_err:
         return lookup_err
     if not booking:
-        return "리마인더를 설정할 본인 예약을 찾지 못했습니다. list_mine으로 booking_id를 확인해 주세요."
+        return (
+            "리마인더를 설정할 본인 예약을 찾지 못했습니다. "
+            "회의실·날짜·시작 시각을 알려주시면 다시 찾아 보겠습니다."
+        )
 
     try:
         start_dt = datetime.fromisoformat(booking.start_time[:19]).replace(tzinfo=KST)
@@ -1300,9 +1306,10 @@ _ROOM_STATUS_KEYWORDS: tuple[str, ...] = (
 )
 
 _TIME_RANGE_RE = re.compile(
-    r"(\d{1,2})\s*시\s*(?:부터|~|～|-)\s*(\d{1,2})\s*시",
+    r"(\d{1,2})\s*시\s*(?:부터|~|～|-)\s*(\d{1,2})\s*시(?!\s*간)",
 )
-_TIME_SINGLE_RE = re.compile(r"(\d{1,2})\s*시")
+# '1시간' 소요시간을 시계 시각(1시)으로 오인하지 않음
+_TIME_SINGLE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*시(?!\s*간)")
 _ISO_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _KO_DATE_RE = re.compile(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일")
 _LIST_MINE_BOOKING_RE = re.compile(

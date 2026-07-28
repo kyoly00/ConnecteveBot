@@ -60,6 +60,12 @@ class TestTimeParsing(unittest.TestCase):
         self.assertEqual(start, "2026-06-18T22:00:00")
         self.assertEqual(end, "2026-06-18T23:00:00")
 
+    def test_duration_hours_not_clock_hour(self):
+        """'1시간'은 소요시간 — 01:00으로 파싱되면 안 됨 (시각은 LLM/세션 슬롯이 채움)."""
+        start, end, _ = parse_time_range_from_query("Atlas 1시간 예약해줘")
+        self.assertIsNone(start)
+        self.assertIsNone(end)
+
     @patch("app.services.outlook_room.schedule_reserve._now_kst")
     def test_now_uses_current_minute(self, mock_now):
         from datetime import datetime

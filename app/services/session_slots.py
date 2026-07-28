@@ -263,33 +263,46 @@ def build_session_slots_block(slots: dict[str, Any] | None) -> str:
 
     lines = [
         "<session_agent_slots>",
-        "직전 성공한 예약/일정/공고의 *참고 후보*다. 사용자가 가리키는 대상을 먼저 파악한다.",
-        "- 질문/대화에 다른 날짜·회의실·제목이 있으면 슬롯 ID를 쓰지 말고, "
-        "room_name·date·start_time·subject 힌트로 tool을 호출해 대상을 resolve한다.",
-        "- '취소해줘'·'수정해줘'처럼 대상이 생략된 짧은 follow-up만 아래 슬롯 ID를 사용한다.",
-        "- 새 주제·다른 예약이면 슬롯을 무시한다.",
+        "직전 대화의 예약/조회/공고 *참고 후보*다. conversation_context와 함께 읽고 "
+        "사용자가 가리키는 대상으로 tool 인자를 채운다 (강제 아님).",
+        "- booking_id·event_id는 내부 식별자다. tool_call 인자에만 쓰고 "
+        "사용자에게 묻거나 답변·확인 문구에 절대 노출하지 않는다.",
+        "- 가용 조회(inquiry) 직후 'OO 1시간 예약해줘'면 아래 date·start_time·end_time을 "
+        "book에 이어 쓰고, 회의실만 질문에서 고른다. 'N시간'은 소요시간이다.",
+        "- 예약 완료 후 cancel/modify/초대는 아래 booking_id(및 room/date/start)를 "
+        "manage_room_schedule 인자에 넣어 대상을 찾는다. search_worker_schedule로 바꾸지 않는다.",
+        "- 다른 날짜·회의실·제목이 명시되면 그 힌트로 resolve하고, 맞으면 슬롯 booking_id도 함께 넣는다.",
+        "- '취소해줘'처럼 대상 생략이면 슬롯 booking_id를 기본으로 쓴다.",
     ]
     if isinstance(sched, dict):
         domain = sched.get("domain") or ""
-        lines.append("[active_schedule] 가장 최근 조작 후보 (기본값일 뿐 강제 아님)")
+        status = sched.get("status") or ""
+        lines.append("[active_schedule] 최근 후보 (기본값일 뿐 강제 아님)")
         lines.append(f"domain={domain}")
+        if status:
+            lines.append(f"status={status}")
         if domain == "room" and sched.get("booking_id"):
             lines.append(f"booking_id={sched['booking_id']}")
         if domain == "personal" and sched.get("event_id"):
             lines.append(f"event_id={sched['event_id']}")
-        for key in ("room_name", "subject", "date", "start_time", "end_time"):
+        for key in ("room_name", "subject", "date", "start_time", "end_time", "focus_time"):
             if sched.get(key):
                 lines.append(f"{key}={sched[key]}")
         if sched.get("attendees"):
             lines.append(f"attendees={sched['attendees']}")
         if domain == "room":
-            lines.append(
-                "생략형 follow-up → manage_room_schedule. "
-                "날짜/회의실이 명시되면 booking_id 없이 힌트만 전달."
-            )
+            if status == "inquiry" or not sched.get("booking_id"):
+                lines.append(
+                    "inquiry/가용 맥락 → book 시 start_time·end_time(또는 +1h)을 슬롯·대화에서 이어 받는다."
+                )
+            else:
+                lines.append(
+                    "예약 확정 맥락 → cancel/modify/초대 시 booking_id를 tool에 넣고 "
+                    "room_name·date·start_time 힌트도 함께 전달. 사용자에게 ID를 요구하지 않는다."
+                )
         elif domain == "personal":
             lines.append(
-                "생략형 follow-up → manage_personal_schedule. "
+                "생략형 follow-up → manage_personal_schedule에 event_id. "
                 "다른 일정이면 event_id 없이 subject+date 힌트."
             )
     if isinstance(gov, dict):
@@ -319,9 +332,10 @@ def apply_slots_to_tool_args(
     query: str = "",
 ) -> dict[str, Any]:
     """
-    슬롯 ID 보강은 *생략형 follow-up*에만.
-    날짜·회의실 등이 이미 있으면 LLM 힌트를 존중하고 booking_id를 넣지 않는다
-    (prepare_booking_target이 room/date/start로 resolve).
+    세션 슬롯 보강 (사용자 비노출).
+    - Turn1에 booking_id를 슬롯으로 보여 LLM이 tool에 넣게 하고,
+      LLM이 빠뜨리면 cancel/modify 등에서 빈 booking_id만 안전하게 채운다.
+    - book + inquiry: 질문 mid에 시계 시각이 없으면 관심 시각을 이어 받는다.
     """
     args = dict(tool_args or {})
     slots = slots or empty_agent_slots()
@@ -331,30 +345,55 @@ def apply_slots_to_tool_args(
         sched = slots.get(SCHEDULE_KEY)
         if isinstance(sched, dict) and sched.get("domain") == "room":
             action = str(args.get("action") or "").strip()
-            if action not in ("cancel", "modify", "replace", "set_reminder"):
-                return args
-            # LLM이 이미 대상을 힌트로 고른 경우 → ID 주입 금지
-            has_llm_target = bool(
-                args.get("date")
-                or args.get("start_time")
-                or args.get("room_name")
-                or args.get("subject")
-                or args.get("booking_id")
-            )
-            if has_llm_target and not is_ambiguous_schedule_followup(q):
-                return args
-            if args_conflict_with_schedule_slot(args, sched) or query_conflicts_with_schedule_slot(q, sched):
-                return args
-            if not is_ambiguous_schedule_followup(q) and has_llm_target:
-                return args
-            # 생략형: 슬롯으로 보강
-            if is_ambiguous_schedule_followup(q) or not has_llm_target:
-                _fill_if_empty(args, "booking_id", sched.get("booking_id"))
-                _fill_if_empty(args, "room_name", sched.get("room_name"))
-                _fill_if_empty(args, "subject", sched.get("subject"))
-                _fill_if_empty(args, "date", sched.get("date"))
-                _fill_if_empty(args, "start_time", sched.get("start_time"))
-                _fill_if_empty(args, "end_time", sched.get("end_time"))
+
+            if action == "book" and (sched.get("status") == "inquiry" or not sched.get("booking_id")):
+                # 'spine으로 1시간 예약'처럼 시각 생략 → 직전 가용 조회 슬롯
+                if not re.search(r"\d{1,2}\s*시|\d{1,2}:\d{2}", q):
+                    if sched.get("start_time"):
+                        args["start_time"] = sched["start_time"]
+                        if sched.get("end_time"):
+                            args["end_time"] = sched["end_time"]
+                        else:
+                            args.pop("end_time", None)
+                    _fill_if_empty(args, "date", sched.get("date"))
+                    _fill_if_empty(args, "room_name", sched.get("room_name"))
+                else:
+                    _fill_if_empty(args, "date", sched.get("date"))
+                    _fill_if_empty(args, "start_time", sched.get("start_time"))
+                    _fill_if_empty(args, "end_time", sched.get("end_time"))
+                    _fill_if_empty(args, "room_name", sched.get("room_name"))
+
+            if action in ("cancel", "modify", "replace", "set_reminder"):
+                room_conflict = False
+                slot_room = _room_key(sched.get("room_name"))
+                arg_room = _room_key(args.get("room_name") or args.get("new_room_name"))
+                if slot_room and arg_room and slot_room != arg_room:
+                    room_conflict = True
+                if not room_conflict:
+                    for raw in _ROOM_IN_TEXT_RE.findall(q):
+                        rk = _room_key(raw)
+                        if rk and slot_room and rk != slot_room:
+                            room_conflict = True
+                            break
+                # booking_id: LLM이 슬롯을 보고 넣는 게 원칙. 빠뜨리면 빈 칸만 보강.
+                # 다른 날짜·시각이 args에 명시되면(충돌) ID를 억지로 넣지 않음.
+                if not room_conflict and sched.get("booking_id"):
+                    if (
+                        is_ambiguous_schedule_followup(q)
+                        or not args_conflict_with_schedule_slot(args, sched)
+                    ):
+                        _fill_if_empty(args, "booking_id", sched.get("booking_id"))
+                        _fill_if_empty(args, "room_name", sched.get("room_name"))
+                if is_ambiguous_schedule_followup(q) and not room_conflict:
+                    _fill_if_empty(args, "subject", sched.get("subject"))
+                    _fill_if_empty(args, "date", sched.get("date"))
+                    _fill_if_empty(args, "start_time", sched.get("start_time"))
+                    _fill_if_empty(args, "end_time", sched.get("end_time"))
+                elif not room_conflict and not args_conflict_with_schedule_slot(args, sched):
+                    _fill_if_empty(args, "subject", sched.get("subject"))
+                    _fill_if_empty(args, "date", sched.get("date"))
+                    _fill_if_empty(args, "start_time", sched.get("start_time"))
+                    _fill_if_empty(args, "end_time", sched.get("end_time"))
 
     elif tool_name == "manage_personal_schedule":
         sched = slots.get(SCHEDULE_KEY)
@@ -362,18 +401,11 @@ def apply_slots_to_tool_args(
             action = str(args.get("action") or "").strip()
             if action not in ("modify", "cancel"):
                 return args
-            has_llm_target = bool(
-                args.get("date")
-                or args.get("start_time")
-                or args.get("subject")
-                or args.get("event_id")
-            )
-            if has_llm_target and not is_ambiguous_schedule_followup(q):
-                return args
             if args_conflict_with_schedule_slot(args, sched) or query_conflicts_with_schedule_slot(q, sched):
                 return args
-            if is_ambiguous_schedule_followup(q) or not has_llm_target:
-                _fill_if_empty(args, "event_id", sched.get("event_id"))
+            # event_id는 modify·cancel 모두 전달
+            _fill_if_empty(args, "event_id", sched.get("event_id"))
+            if is_ambiguous_schedule_followup(q):
                 _fill_if_empty(args, "subject", sched.get("subject"))
                 _fill_if_empty(args, "date", sched.get("date"))
                 _fill_if_empty(args, "start_time", sched.get("start_time"))
@@ -468,6 +500,16 @@ def suggest_slot_followup_call(
                 "start_time": sched.get("start_time"),
                 "subject": sched.get("subject"),
             }
+            # 초대 follow-up: 질문에 있는 이름을 attendees로 (빈 modify 방지)
+            if wants_attendee:
+                try:
+                    from app.services.flex_hr.flex_hr import match_employees_in_query
+
+                    names = match_employees_in_query(q)
+                    if names:
+                        args["attendees"] = [{"name": n} for n in names]
+                except Exception:
+                    pass
             return {"tool": "manage_room_schedule", "args": args}
         return None
 
@@ -528,7 +570,42 @@ def should_override_with_slot_followup(
         if forced and forced["tool"] not in names:
             if _FOLLOWUP_CANCEL.search(q) or _FOLLOWUP_MODIFY.search(q) or _FOLLOWUP_ATTENDEE.search(q):
                 return True
+    # 초대인데 flex/personal만 고른 경우 → room modify로 되돌림
+    if (
+        _FOLLOWUP_ATTENDEE.search(q)
+        and "manage_room_schedule" not in names
+        and suggest_slot_followup_call(query, slots)
+    ):
+        forced = suggest_slot_followup_call(query, slots)
+        if forced and forced["tool"] == "manage_room_schedule" and forced.get("args", {}).get("attendees"):
+            return True
     return False
+
+
+def _slot_time_from_check_args(args: dict[str, Any]) -> dict[str, Any]:
+    """check/check_all 인자에서 관심 시각 후보 추출 (LLM 참고용)."""
+    start = str(args.get("start_time") or "").strip() or None
+    end = str(args.get("end_time") or "").strip() or None
+    date_raw = str(args.get("date") or "").strip() or None
+    end_date = str(args.get("end_date") or "").strip() or None
+    focus = str(args.get("focus_time") or "").strip() or None
+    # LLM이 date/end_date에 ISO datetime을 넣는 경우
+    if not start and date_raw and "T" in date_raw:
+        start = date_raw[:19]
+        date_raw = date_raw[:10]
+    if not end and end_date and "T" in end_date:
+        end = end_date[:19]
+    if date_raw and len(date_raw) >= 10:
+        date_raw = date_raw[:10]
+    elif start and len(start) >= 10:
+        date_raw = start[:10]
+    return {
+        "date": date_raw,
+        "start_time": start,
+        "end_time": end,
+        "focus_time": focus,
+        "room_name": str(args.get("room_name") or "").strip() or None,
+    }
 
 
 def merge_slots_from_tool_result(
@@ -548,6 +625,22 @@ def merge_slots_from_tool_result(
 
     if tool_name == "manage_room_schedule":
         action = str(result.get("action") or args.get("action") or "").strip()
+        if action in ("check", "check_all"):
+            # 이미 확정 예약이 있으면 inquiry로 덮지 않음
+            existing = slots.get(SCHEDULE_KEY)
+            if isinstance(existing, dict) and existing.get("booking_id"):
+                return slots
+            interest = _slot_time_from_check_args(args)
+            if not (interest.get("start_time") or interest.get("date") or interest.get("focus_time")):
+                return slots
+            return set_active_schedule(
+                slots,
+                {
+                    "domain": "room",
+                    "status": "inquiry",
+                    **{k: v for k, v in interest.items() if v},
+                },
+            )
         if action == "cancel":
             content = tool_content or ""
             if "찾지 못" in content or "실패" in content:
@@ -557,22 +650,48 @@ def merge_slots_from_tool_result(
             return slots
         if action in ("list", "list_mine"):
             # 조회 결과로 슬롯 갱신: 단건이면 그 예약, 다건이면 슬롯 비움(오취소 방지)
+            # 단, 이미 booked인 예약을 주간 list args(date=주 시작)로 덮어쓰지 않음
             found = _BOOKING_ID_INLINE_RE.findall(tool_content or "")
             if not found:
                 found = _BOOKING_ID_RE.findall(tool_content or "")
             uniq = list(dict.fromkeys(found))
+            existing = slots.get(SCHEDULE_KEY) if isinstance(slots.get(SCHEDULE_KEY), dict) else {}
             if len(uniq) == 1:
-                return set_active_schedule(
-                    slots,
-                    {
-                        "domain": "room",
-                        "booking_id": uniq[0],
-                        "room_name": args.get("room_name") or (slots.get(SCHEDULE_KEY) or {}).get("room_name"),
-                        "date": args.get("date") or (slots.get(SCHEDULE_KEY) or {}).get("date"),
-                        "start_time": args.get("start_time"),
-                        "subject": args.get("subject"),
-                    },
+                bid = uniq[0]
+                keep = (
+                    isinstance(existing, dict)
+                    and existing.get("booking_id") == bid
+                    and existing.get("status") == "booked"
                 )
+                if keep:
+                    # list는 식별만 확인하고 확정 슬롯(date/start)은 유지
+                    return slots
+                payload = {
+                    "domain": "room",
+                    "status": "booked",
+                    "booking_id": bid,
+                    "room_name": args.get("room_name") or existing.get("room_name"),
+                    "subject": args.get("subject") or existing.get("subject"),
+                }
+                # list tool args의 주간 date는 예약 시각이 아님 → content에서 시각 추출 시도
+                parsed_start = None
+                m = re.search(
+                    rf"{re.escape(bid)}[^\n]*?(\d{{4}}-\d{{2}}-\d{{2}})\s+(\d{{2}}:\d{{2}})",
+                    tool_content or "",
+                    re.I,
+                )
+                if m:
+                    payload["date"] = m.group(1)
+                    parsed_start = f"{m.group(1)}T{m.group(2)}:00"
+                    payload["start_time"] = parsed_start
+                elif existing.get("date") or existing.get("start_time"):
+                    if existing.get("date"):
+                        payload["date"] = existing["date"]
+                    if existing.get("start_time"):
+                        payload["start_time"] = existing["start_time"]
+                    if existing.get("end_time"):
+                        payload["end_time"] = existing["end_time"]
+                return set_active_schedule(slots, payload)
             if len(uniq) > 1:
                 return clear_active_schedule(slots)
             return slots
@@ -582,6 +701,7 @@ def merge_slots_from_tool_result(
                 return slots
             payload = {
                 "domain": "room",
+                "status": "booked",
                 "booking_id": bid or (slots.get(SCHEDULE_KEY) or {}).get("booking_id"),
                 "room_name": result.get("room_name") or args.get("room_name") or args.get("new_room_name"),
                 "subject": args.get("new_subject") or args.get("subject") or result.get("subject"),

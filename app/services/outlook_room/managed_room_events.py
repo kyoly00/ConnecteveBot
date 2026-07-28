@@ -818,7 +818,7 @@ async def resolve_owned_event(
 
     return None, (
         "취소·변경할 예약을 찾지 못했습니다. "
-        "list_mine으로 booking_id를 확인하거나 회의실·날짜·시간을 알려주세요."
+        "회의실·날짜·시작 시각을 알려주시면 다시 찾아 보겠습니다."
     )
 
 

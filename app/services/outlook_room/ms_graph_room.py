@@ -291,7 +291,10 @@ def _event_bounds(ev: dict) -> tuple[str, str]:
 
 
 def times_overlap(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
-    """ISO 로컬 시각 문자열 구간 겹침 (KST)."""
+    """
+    ISO 로컬 시각 구간 겹침 (KST).
+    반개구간 [start, end) — 한쪽 끝과 다른 쪽 시작이 같으면(예: 14~18 / 18~19) 겹치지 않음.
+    """
     sa, ea = start_a[:19], end_a[:19]
     sb, eb = start_b[:19], end_b[:19]
     if not all([sa, ea, sb, eb]):

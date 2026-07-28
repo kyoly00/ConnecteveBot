@@ -246,6 +246,7 @@ def test_slots_block_says_candidate_not_force():
         {
             "active_schedule": {
                 "domain": "room",
+                "status": "booked",
                 "booking_id": "33333333-3333-3333-3333-333333333333",
                 "room_name": "Spine",
                 "date": "2026-07-30",
@@ -254,4 +255,70 @@ def test_slots_block_says_candidate_not_force():
         }
     )
     assert "참고 후보" in block or "강제 아님" in block
-    assert "힌트" in block
+    assert "booking_id=" in block
+    assert "사용자에게" in block or "노출" in block
+
+
+def test_cancel_and_modify_fill_booking_id_when_compatible():
+    """cancel·modify 모두 슬롯 booking_id를 빈 인자에 보강 (사용자 노출용 아님)."""
+    slots = {
+        "active_schedule": {
+            "domain": "room",
+            "status": "booked",
+            "booking_id": "f5d492aa-df54-474b-aec5-dfc599576fff",
+            "room_name": "Spine 회의실",
+            "date": "2026-07-29",
+            "start_time": "2026-07-29T18:00:00",
+            "subject": "회의",
+        },
+        "active_gov": None,
+    }
+    cancel_args = apply_slots_to_tool_args(
+        "manage_room_schedule",
+        {
+            "action": "cancel",
+            "date": "2026-07-29",
+            "start_time": "2026-07-29T18:00:00",
+            "subject": "회의",
+        },
+        slots,
+        "내일 6시 회의 삭제해줘",
+    )
+    assert cancel_args["booking_id"].startswith("f5d492aa")
+    assert "Spine" in (cancel_args.get("room_name") or "")
+
+    modify_args = apply_slots_to_tool_args(
+        "manage_room_schedule",
+        {
+            "action": "modify",
+            "date": "2026-07-29",
+            "start_time": "2026-07-29T18:00:00",
+            "attendees": ["이소연"],
+        },
+        slots,
+        "소연님 초대해줘",
+    )
+    assert modify_args["booking_id"].startswith("f5d492aa")
+
+
+def test_check_inquiry_slot_for_book_followup():
+    """가용 조회 후 관심 시각이 세션 슬롯에 남아 Turn1 LLM이 book에 이어 쓰게 한다."""
+    slots = empty_agent_slots()
+    slots = merge_slots_from_tool_result(
+        slots,
+        tool_name="manage_room_schedule",
+        tool_result={"action": "check_all"},
+        tool_args={
+            "action": "check_all",
+            "date": "2026-07-28T15:00:00",
+            "end_date": "2026-07-28T16:00:00",
+        },
+        tool_content="가용",
+    )
+    sched = slots["active_schedule"]
+    assert sched["status"] == "inquiry"
+    assert sched["start_time"].startswith("2026-07-28T15:00")
+    assert sched["date"] == "2026-07-28"
+    block = build_session_slots_block(slots)
+    assert "inquiry" in block
+    assert "15:00" in block

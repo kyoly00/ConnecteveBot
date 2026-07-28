@@ -333,15 +333,18 @@ _MANAGE_ROOM_SCHEDULE_TOOL: dict[str, Any] = {
         "description": (
             "Outlook 회의·회의실 예약·조회·취소·변경. "
             f"가용·예약(check/check_all/book): 오늘~{SYNC_WINDOW_DAYS}일 이내({format_query_window_label()})만. "
-            "list: 본인·타인 **회의실에 잡힌** 일정만(과거 최대 10일·미래 7일, DB). "
+            "**조회 action 구분(중요)**: "
+            "check_all=모든 회의실·전체 회의실의 하루 occupied(시각 미지정이면 00:00~24:00 전 구간). "
+            "person_name 사용 금지. "
+            "예: '오늘 모든 회의실 전체 일정'·'회의실 예약 현황'·'전체 회의실 스케줄' → check_all(date). "
+            "list=특정 사람(본인·person_name)이 주최·참석한 회의실 일정만(과거 최대 10일·미래 7일, DB). "
+            "'모든/전체 회의실' 질문에는 list 금지. "
+            "예: '내 회의'·'OO님 회의 일정' → list(person_name 생략 또는 지정, date). "
+            "check=특정 room_name 한 곳 가용·점유. "
             "본인 Outlook 전체 일정·일반 미팅 생성/변경/취소는 manage_personal_schedule. "
-            "list: person_name 생략=본인. 하루=date만, 기간=date+end_date 또는 생략(7일). "
-            "'OO님 회의'·'이번 주 소연님 미팅' → list(person_name, date, end_date). "
-            "과거·참석자·누구랑 → list(date=해당일), check 금지. "
             "room_name·start_time·end_time이 모두 있으면 book 즉시 (제목 생략 시 '회의'). "
             "cancel/modify/replace/set_reminder: Turn1은 room/date/subject 등 식별 힌트 전달. "
             "tool 실행 시 Outlook→DB 동기화 후 booking_id 확정·action 수행. "
-            "회의실명 없이 날짜·시간만 예약·가용 조회일 때만 check_all. "
             f"회의실: {list_rooms()}. "
             "book·cancel 등 쓰기는 요청자 Slack 이메일이 주최자. "
             "room_name은 사용자 표현(오타·별칭 포함)을 아래 힌트 중 하나로 LLM이 정규화해 전달."
@@ -356,8 +359,11 @@ _MANAGE_ROOM_SCHEDULE_TOOL: dict[str, Any] = {
                         "cancel", "modify", "replace", "set_reminder",
                     ],
                     "description": (
-                        "check=특정 회의실 가용·점유(현재·미래), check_all=전체 회의실 조회·슬롯 가용, "
-                        "list=회의 일정(person_name 생략=본인, 하루=date, 기간=date+end_date|생략; 과거·참석 포함), "
+                        "check=특정 회의실(room_name) 가용·점유, "
+                        "check_all=모든 회의실 하루 occupied·슬롯 가용 "
+                        "('모든/전체 회의실'·'예약 현황'; 시각 없으면 하루 전체; person_name 금지), "
+                        "list=특정 사람 주최·참석 회의실 일정 "
+                        "(person_name 생략=본인; '모든 회의실'에는 사용 금지), "
                         "book=예약 (room_name·start_time·end_time 있으면 즉시; subject 생략 시 '회의'; 회의실명 없으면 check_all 먼저), "
                         "cancel=본인 예약 취소 (room/date/subject 힌트 → DB booking_id 확정), "
                         "modify=본인 예약 변경 (힌트로 대상 확정 + 변경 필드), "
@@ -373,6 +379,7 @@ _MANAGE_ROOM_SCHEDULE_TOOL: dict[str, Any] = {
                     "type": "string",
                     "description": (
                         f"list·check용. check/check_all은 오늘~{SYNC_WINDOW_DAYS}일 이내만. "
+                        "check_all 하루 조회는 date만(시각 없으면 해당일 전체 occupied). "
                         "list는 과거 10일·미래 7일. 하루=date만, 기간=list는 date+end_date."
                     ),
                 },
@@ -963,9 +970,16 @@ def build_initial_messages(
     if recent_ctx:
         messages.append({"role": "system", "content": recent_ctx})
 
-    flex_hint = build_flex_schedule_router_block(query_stripped)
-    if flex_hint:
-        messages.append({"role": "system", "content": flex_hint})
+    # 회의 초대/참석자 follow-up인데 flex 이름 힌트가 끼면 근태로 새는 경우 방지
+    _invite_followup = bool(
+        re.search(r"(초대|참석|같이\s*할)", query_stripped or "")
+        and isinstance((agent_slots or {}).get("active_schedule"), dict)
+        and (agent_slots.get("active_schedule") or {}).get("domain") == "room"
+    )
+    if not _invite_followup:
+        flex_hint = build_flex_schedule_router_block(query_stripped)
+        if flex_hint:
+            messages.append({"role": "system", "content": flex_hint})
 
     if match_gov_in_query(query_stripped):
         gov_catalog = build_gov_briefing_catalog_block()
@@ -2093,6 +2107,7 @@ async def execute_manage_room_schedule(
 ) -> tuple[str, dict[str, Any]]:
     """manage_room_schedule tool 실행."""
     from app.services.outlook_room.attendee_resolver import resolve_organizer_email
+    from app.services.outlook_room.attendee_resolver import normalize_attendee_items
     from app.services.outlook_room.schedule_reserve import _NO_EMAIL_MSG
 
     tool_args = normalize_room_tool_args(
@@ -2156,14 +2171,9 @@ async def execute_manage_room_schedule(
         return sanitize_user_facing_tool_message(_NO_EMAIL_MSG), tool_result
 
     def _attendee_list() -> list[dict[str, str]]:
-        out: list[dict[str, str]] = []
-        if isinstance(extra_attendees, list):
-            for item in extra_attendees:
-                if isinstance(item, dict):
-                    cleaned = {k: str(v) for k, v in item.items() if v}
-                    if cleaned:
-                        out.append(cleaned)
-        return out
+        return normalize_attendee_items(
+            extra_attendees if isinstance(extra_attendees, list) else None
+        )
 
     logger.info(
         "[Agent] 도구 실행. name=manage_room_schedule, action=%r, room=%r",

@@ -20,6 +20,46 @@ logger = logging.getLogger(__name__)
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^\s@]+$")
 
 
+def normalize_attendee_items(raw_attendees: list[Any] | None) -> list[dict[str, str]]:
+    """
+    LLM/슬롯 attendees → resolve용 [{email?, name?, slack_user_id?}].
+
+    문자열 '이소연' / 'a@b.com' 과 dict 혼용을 모두 허용 (book·modify 공통).
+    """
+    out: list[dict[str, str]] = []
+    for item in raw_attendees or []:
+        if isinstance(item, str):
+            text = item.strip()
+            if not text:
+                continue
+            # Slack mailto 표기 잔여
+            text = re.sub(r"^<mailto:([^|>]+)(?:\|[^>]+)?>$", r"\1", text, flags=re.I)
+            if "@" in text:
+                out.append({
+                    "email": text,
+                    "name": text.split("@")[0],
+                })
+            else:
+                out.append({"name": text})
+            continue
+        if not isinstance(item, dict):
+            continue
+        cleaned: dict[str, str] = {}
+        email = str(item.get("email") or item.get("address") or "").strip()
+        name = str(item.get("name") or "").strip()
+        slack_user_id = str(item.get("slack_user_id") or "").strip()
+        if email:
+            email = re.sub(r"^<mailto:([^|>]+)(?:\|[^>]+)?>$", r"\1", email, flags=re.I)
+            cleaned["email"] = email
+        if name:
+            cleaned["name"] = name
+        if slack_user_id:
+            cleaned["slack_user_id"] = slack_user_id
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
 def _match_employees_in_query(query: str) -> list[str]:
     from app.services.flex_hr.flex_hr import match_employees_in_query
 
@@ -210,11 +250,8 @@ async def resolve_attendees(
     resolved: list[dict[str, str]] = []
     unresolved: list[str] = []
 
-    for item in raw_attendees or []:
-        if not isinstance(item, dict):
-            continue
-
-        email = str(item.get("email") or item.get("address") or "").strip()
+    for item in normalize_attendee_items(raw_attendees):
+        email = str(item.get("email") or "").strip()
         name = str(item.get("name") or "").strip()
         slack_user_id = str(item.get("slack_user_id") or "").strip()
         if not email and not name and not slack_user_id:
